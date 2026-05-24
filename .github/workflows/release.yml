@@ -1,0 +1,192 @@
+name: Release
+
+# Manually triggered from the Actions tab. You provide a version (the tag to
+# create); this builds the binaries, signs + notarizes the macOS ones, packages
+# everything as tarballs with checksums, publishes a GitHub Release, and bumps
+# the Homebrew tap formula.
+#
+# One-time setup (secrets / variables) is documented in RELEASING.md. Signing
+# and the tap update are skipped gracefully if their secrets aren't configured,
+# so the workflow still produces a release before you've set them up.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version / tag to release (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+  id-token: write # for build provenance attestation
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      # True only when the macOS signing secrets are present.
+      HAS_SIGNING: ${{ secrets.MACOS_CERT_P12 != '' && secrets.ASC_API_PRIVATE_KEY != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # Zig cross-compiles every target from this one Linux runner.
+      - name: Build binaries
+        run: |
+          mkdir -p dist
+          for target in aarch64-macos x86_64-macos x86_64-linux aarch64-linux; do
+            echo "::group::Building $target"
+            zig build -Doptimize=ReleaseSafe -Dtarget="$target"
+            cp zig-out/bin/toggl "dist/toggl-$target"
+            echo "::endgroup::"
+          done
+
+      # rcodesign signs and notarizes macOS binaries from Linux.
+      - name: Install rcodesign
+        if: env.HAS_SIGNING == 'true'
+        run: cargo install apple-codesign --locked
+
+      - name: Sign & notarize macOS binaries
+        if: env.HAS_SIGNING == 'true'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_PRIVATE_KEY: ${{ secrets.ASC_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          # Materialize credentials from secrets.
+          echo "$MACOS_CERT_P12" | base64 -d > cert.p12
+          printf '%s' "$MACOS_CERT_PASSWORD" > p12pass.txt
+          printf '%s' "$ASC_API_PRIVATE_KEY" > AuthKey.p8
+          rcodesign encode-app-store-connect-api-key -o asc.json \
+            "$ASC_API_ISSUER_ID" "$ASC_API_KEY_ID" AuthKey.p8
+
+          for b in toggl-aarch64-macos toggl-x86_64-macos; do
+            echo "::group::Signing $b"
+            # Developer ID signature + hardened runtime (required for notarization).
+            rcodesign sign \
+              --p12-file cert.p12 --p12-password-file p12pass.txt \
+              --code-signature-flags runtime \
+              "dist/$b"
+            # Notarization needs a container; a zip of the bare binary is fine.
+            # Bare CLI binaries can't be stapled, so Gatekeeper verifies online.
+            (cd dist && zip -q "$b.zip" "$b")
+            rcodesign notary-submit --api-key-file asc.json --wait "dist/$b.zip"
+            echo "::endgroup::"
+          done
+
+          rm -f cert.p12 p12pass.txt AuthKey.p8 asc.json
+
+      # Package each binary as <name>.tar.gz containing a file named `toggl`
+      # (what the Homebrew formula installs), then checksum them.
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          for target in aarch64-macos x86_64-macos x86_64-linux aarch64-linux; do
+            staging="pkg/$target"
+            mkdir -p "$staging"
+            cp "dist/toggl-$target" "$staging/toggl"
+            chmod +x "$staging/toggl"
+            tar -czf "out/toggl-$target.tar.gz" -C "$staging" toggl
+          done
+          (cd out && sha256sum toggl-*.tar.gz > SHA256SUMS)
+          cat out/SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "out/toggl-*.tar.gz"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: ${{ inputs.version }}
+          generate_release_notes: true
+          files: |
+            out/toggl-*.tar.gz
+            out/SHA256SUMS
+
+  # Bump the formula in your Homebrew tap. Skipped unless HOMEBREW_TAP_REPO
+  # (a repo variable, e.g. you/homebrew-tap) and HOMEBREW_TAP_TOKEN (a PAT with
+  # contents:write on that repo) are configured.
+  homebrew:
+    needs: release
+    if: ${{ vars.HOMEBREW_TAP_REPO != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tap
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.HOMEBREW_TAP_REPO }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Render & commit formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          REPO: ${{ github.repository }}
+          SERVER: ${{ github.server_url }}
+        run: |
+          set -euo pipefail
+
+          # Pull the checksums published with the release.
+          gh release download "$VERSION" --repo "$REPO" --pattern SHA256SUMS --dir .
+          sha() { grep " toggl-$1.tar.gz\$" SHA256SUMS | cut -d' ' -f1; }
+
+          base="$SERVER/$REPO/releases/download/$VERSION"
+          # Strip a leading "v" for the formula version field.
+          ver="${VERSION#v}"
+
+          mkdir -p Formula
+          cat > Formula/toggl.rb <<EOF
+          class Toggl < Formula
+            desc "Command-line client for Toggl Track"
+            homepage "$SERVER/$REPO"
+            version "$ver"
+
+            on_macos do
+              on_arm do
+                url "$base/toggl-aarch64-macos.tar.gz"
+                sha256 "$(sha aarch64-macos)"
+              end
+              on_intel do
+                url "$base/toggl-x86_64-macos.tar.gz"
+                sha256 "$(sha x86_64-macos)"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "$base/toggl-aarch64-linux.tar.gz"
+                sha256 "$(sha aarch64-linux)"
+              end
+              on_intel do
+                url "$base/toggl-x86_64-linux.tar.gz"
+                sha256 "$(sha x86_64-linux)"
+              end
+            end
+
+            def install
+              bin.install "toggl"
+            end
+
+            test do
+              assert_match "toggl", shell_output("#{bin}/toggl help")
+            end
+          end
+          EOF
+
+          rm -f SHA256SUMS
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/toggl.rb
+          git commit -m "toggl $VERSION"
+          git push

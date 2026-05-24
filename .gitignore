@@ -1,0 +1,11 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Older Zig versions used this cache directory name
+zig-cache/
+
+# macOS
+.DS_Store
+
+RELEASING.md
