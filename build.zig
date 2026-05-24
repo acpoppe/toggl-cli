@@ -4,6 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Version baked into the binary (`toggl version`). The release workflow
+    // passes `-Dversion=<tag>`; local builds report "dev".
+    const version = b.option([]const u8, "version", "Version string for `toggl version`") orelse "dev";
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+
     // A single executable built from src/main.zig. The other src/*.zig files
     // are pulled in via relative `@import`, so they don't need to be wired up
     // here.
@@ -23,6 +29,9 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag == .macos) {
         exe.headerpad_max_install_names = true;
     }
+
+    // Make the baked version importable as `@import("build_options")`.
+    exe.root_module.addOptions("build_options", build_options);
 
     b.installArtifact(exe);
 

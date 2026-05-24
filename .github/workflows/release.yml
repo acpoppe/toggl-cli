@@ -36,11 +36,14 @@ jobs:
 
       # Zig cross-compiles every target from this one Linux runner.
       - name: Build binaries
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
           mkdir -p dist
+          ver="${VERSION#v}" # bake "1.0.0", not "v1.0.0"
           for target in aarch64-macos x86_64-macos x86_64-linux aarch64-linux; do
             echo "::group::Building $target"
-            zig build -Doptimize=ReleaseSafe -Dtarget="$target"
+            zig build -Doptimize=ReleaseSafe -Dtarget="$target" -Dversion="$ver"
             cp zig-out/bin/toggl "dist/toggl-$target"
             echo "::endgroup::"
           done

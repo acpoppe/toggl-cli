@@ -7,6 +7,7 @@ const timefmt = @import("timefmt.zig");
 const cache = @import("cache.zig");
 const picker = @import("picker.zig");
 const localtz = @import("localtz.zig");
+const build_options = @import("build_options");
 
 const usage =
     \\toggl - control Toggl Track time entries from the command line
@@ -19,6 +20,7 @@ const usage =
     \\  toggl update [opts]                Edit an entry (interactive, or running with flags)
     \\  toggl list [count]                 List recent entries (default 10)
     \\  toggl sync                         Refresh the cached project/task list
+    \\  toggl version                      Print the version (also --version)
     \\
     \\Options (for start / update):
     \\  -p, --project <id|name>  Project id, or name to match (opens a picker
@@ -174,6 +176,11 @@ fn run(
 
     const cmd = args[1];
     const rest = args[2..];
+
+    if (eql(cmd, "version") or eql(cmd, "--version") or eql(cmd, "-v")) {
+        try out.print("toggl {s}\n", .{build_options.version});
+        return;
+    }
 
     // `toggl help`, `toggl help <command>`, and bare `-h`/`--help`.
     if (eql(cmd, "help") or eql(cmd, "-h") or eql(cmd, "--help")) {

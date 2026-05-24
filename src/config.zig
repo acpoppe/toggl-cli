@@ -41,7 +41,17 @@ pub fn save(arena: std.mem.Allocator, io: Io, environ_map: *std.process.Environ.
     var out: Io.Writer.Allocating = .init(arena);
     try std.json.Stringify.value(cfg, .{ .whitespace = .indent_2 }, &out.writer);
 
-    try home.writeFile(io, .{ .sub_path = file_rel, .data = out.written() });
+    // The file holds the API token in plaintext, so keep it owner-only (0600).
+    // `permissions` only applies when the file is created, so also chmod an
+    // existing file to tighten it.
+    try home.writeFile(io, .{
+        .sub_path = file_rel,
+        .data = out.written(),
+        .flags = .{ .permissions = Io.File.Permissions.fromMode(0o600) },
+    });
+    var file = try home.openFile(io, file_rel, .{});
+    defer file.close(io);
+    try file.setPermissions(io, Io.File.Permissions.fromMode(0o600));
 }
 
 /// Human-readable path to the config file, for messages.
