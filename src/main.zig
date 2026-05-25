@@ -20,6 +20,7 @@ const usage =
     \\  toggl stop                         Stop the currently running entry
     \\  toggl status                       Show the currently running entry
     \\  toggl update [opts]                Edit an entry (interactive, or running with flags)
+    \\  toggl add                          Add a new entry (interactive editor)
     \\  toggl delete                       Delete an entry (interactive, confirms first)
     \\  toggl list [count]                 List recent entries (default 10)
     \\  toggl sync                         Refresh the cached project/task list
@@ -131,6 +132,21 @@ const help_update =
     \\  toggl update -d "renamed task"
     \\  toggl update -p backend
     \\  toggl update -p 12345 -t urgent
+    \\
+;
+
+const help_add =
+    \\toggl add
+    \\
+    \\Create a new time entry from scratch using the same editor as `toggl
+    \\update`: set the description, project, tags, and times, then Save.
+    \\
+    \\The start time is seeded with the current time and is the only required
+    \\field. Leave the stop time empty to create a running entry (refused if one
+    \\is already running); set a stop time to log a completed past entry.
+    \\
+    \\Times accept an absolute local "YYYY-MM-DD HH:MM" / "HH:MM today", or a
+    \\relative offset like -45m / +1h applied to the field's current value.
     \\
 ;
 
@@ -251,6 +267,8 @@ fn run(
         try cmdStatus(arena, io, env, out);
     } else if (eql(cmd, "update")) {
         try cmdUpdate(arena, io, env, out, rest);
+    } else if (eql(cmd, "add")) {
+        try cmdAdd(arena, io, env, out);
     } else if (eql(cmd, "delete") or eql(cmd, "rm")) {
         try cmdDelete(arena, io, env, out);
     } else if (eql(cmd, "list") or eql(cmd, "ls")) {
@@ -261,6 +279,8 @@ fn run(
         try cmdPickDemo(arena, io, out);
     } else if (eql(cmd, "editdemo")) {
         try cmdEditDemo(arena, io, out);
+    } else if (eql(cmd, "adddemo")) {
+        try cmdAddDemo(arena, io, out);
     } else {
         color.eprint("unknown command: {s}\n\n", .{cmd});
         try out.writeAll(usage);
@@ -277,6 +297,7 @@ fn commandHelp(cmd: []const u8) ?[]const u8 {
     if (eql(cmd, "stop")) return help_stop;
     if (eql(cmd, "status") or eql(cmd, "current")) return help_status;
     if (eql(cmd, "update")) return help_update;
+    if (eql(cmd, "add")) return help_add;
     if (eql(cmd, "delete") or eql(cmd, "rm")) return help_delete;
     if (eql(cmd, "list") or eql(cmd, "ls")) return help_list;
     if (eql(cmd, "sync")) return help_sync;
@@ -532,7 +553,7 @@ fn interactiveUpdate(
     out: *Io.Writer,
 ) !void {
     const sel = try pickEntry(arena, io, env, client, out, "Pick an entry to edit — type to filter, ^J/^K or arrows move, Enter select, Esc cancel") orelse return;
-    try editEntry(arena, io, out, client, sel.entry, sel.projects, sel.zone);
+    try editEntry(arena, io, out, client, .edit, sel.entry, sel.projects, sel.zone);
 }
 
 /// A chosen entry plus the context needed to display/act on it.
@@ -615,6 +636,35 @@ fn cmdDelete(
     try printEntry(io, out, sel.entry, sel.projects, sel.zone);
 }
 
+/// Create a new entry from scratch using the field-menu editor. Start is seeded
+/// with "now"; leaving stop empty creates a running entry, setting it logs a
+/// completed one.
+fn cmdAdd(
+    arena: std.mem.Allocator,
+    io: Io,
+    env: *std.process.Environ.Map,
+    out: *Io.Writer,
+) !void {
+    var client = try makeClient(arena, io, env);
+    defer client.deinit();
+
+    const projects = try ensureCache(arena, io, env, &client);
+    const zone = localtz.load(arena, io);
+
+    const template = api.Client.TimeEntry{
+        .id = 0,
+        .workspace_id = 0,
+        .start = try timefmt.epochToRfc3339Alloc(arena, timefmt.nowUnix(io)),
+        .duration = -1, // running until a stop is added
+    };
+    try editEntry(arena, io, out, &client, .add, template, projects, zone);
+}
+
+/// Whether the field-menu editor is editing an existing entry or creating a new
+/// one. In `.add` mode Save creates (POST) and the entry is running iff no stop
+/// is set; in `.edit` mode Save updates (PUT) and the running state is fixed.
+const EditMode = enum { edit, add };
+
 /// The field-menu editor for a single entry. `client` is optional: when null
 /// (demo mode) Save just prints the pending values instead of calling the API.
 fn editEntry(
@@ -622,12 +672,11 @@ fn editEntry(
     io: Io,
     out: *Io.Writer,
     client: ?*api.Client,
+    mode: EditMode,
     entry: api.Client.TimeEntry,
     projects: []const cache.Entry,
     zone: localtz.Zone,
 ) !void {
-    const running = entry.duration < 0;
-
     var desc: []const u8 = entry.description orelse "";
     var project_id: ?i64 = entry.project_id;
     var task_id: ?i64 = entry.task_id;
@@ -641,6 +690,9 @@ fn editEntry(
     const Action = enum { description, project, tags, start, stop, save, cancel };
 
     while (true) {
+        // Add mode: running iff no stop is set. Edit mode: fixed by the entry.
+        const running = if (mode == .add) (stop_epoch == null) else (entry.duration < 0);
+
         const proj_disp = if (project_id) |pid|
             (lookupLabel(projects, pid, task_id) orelse "(unknown)")
         else
@@ -663,8 +715,16 @@ fn editEntry(
         try actions.append(arena, .tags);
         try labels.append(arena, try fieldRow(arena, "Start time:   ", try fmtStart(arena, io, zone, start_epoch, running), null));
         try actions.append(arena, .start);
-        if (!running) {
-            try labels.append(arena, try fieldRow(arena, "Stop time:    ", try fmtInstant(arena, zone, stop_epoch), null));
+        // Add mode always offers a stop field: setting it logs a completed
+        // entry, leaving it empty creates a running one.
+        if (mode == .add or !running) {
+            const stop_disp = if (stop_epoch) |se|
+                try fmtInstant(arena, zone, se)
+            else if (mode == .add)
+                "(none) → will run"
+            else
+                "(unknown)";
+            try labels.append(arena, try fieldRow(arena, "Stop time:    ", stop_disp, null));
             try actions.append(arena, .stop);
         }
         try labels.append(arena, try styled(arena, .green, "Save changes"));
@@ -673,10 +733,13 @@ fn editEntry(
         try actions.append(arena, .cancel);
 
         const choice = try picker.pickIndex(arena, io, labels.items, .{
-            .title = "Editing entry — j/k or arrows move, Enter select, Esc cancel",
+            .title = if (mode == .add)
+                "New entry — j/k or arrows move, Enter select, Esc cancel"
+            else
+                "Editing entry — j/k or arrows move, Enter select, Esc cancel",
             .show_filter = false,
         }) orelse {
-            try color.write(out, .dim, "No changes saved.\n");
+            try color.write(out, .dim, if (mode == .add) "Not added.\n" else "No changes saved.\n");
             return;
         };
 
@@ -709,18 +772,75 @@ fn editEntry(
                 }
             },
             .start => {
-                if (try editTime(arena, io, out, zone, "start", start_epoch)) |ne| {
+                if (try editTime(arena, io, out, zone, "start", start_epoch, timefmt.nowUnix(io))) |ne| {
                     start_epoch = ne;
                     time_changed = true;
                 }
             },
             .stop => {
-                if (try editTime(arena, io, out, zone, "stop", stop_epoch)) |ne| {
+                // A not-yet-set stop offsets relative to now (like start), so
+                // e.g. start "-1h" + stop "-15m" logs a 45-minute entry.
+                if (try editTime(arena, io, out, zone, "stop", stop_epoch, timefmt.nowUnix(io))) |ne| {
                     stop_epoch = ne;
                     time_changed = true;
                 }
             },
             .save => {
+                if (mode == .add) {
+                    const se = start_epoch orelse {
+                        try color.write(out, .red, "Set a start time first.\n");
+                        try out.flush();
+                        continue;
+                    };
+                    // No stop -> running entry; a stop -> completed (duration).
+                    var duration: i64 = -1;
+                    if (stop_epoch) |pe| {
+                        if (pe <= se) {
+                            try color.write(out, .red, "Stop must be after start — adjust the times and try again.\n");
+                            try out.flush();
+                            continue;
+                        }
+                        duration = pe - se;
+                    }
+                    // Creating a running entry must not silently replace one.
+                    if (duration < 0) if (client) |c| {
+                        if (try c.current()) |_| {
+                            try color.write(out, .red, "An entry is already running. Set a stop time to log a completed entry, or stop it first.\n");
+                            try out.flush();
+                            continue;
+                        }
+                    };
+
+                    if (client) |c| {
+                        const created = try c.create(.{
+                            .description = desc,
+                            .start = try timefmt.epochToRfc3339Alloc(arena, se),
+                            .duration = duration,
+                            .project_id = project_id,
+                            .task_id = task_id,
+                            .tags = tags.items,
+                        });
+                        try header(out, .green, "Added:");
+                        try printEntry(io, out, created, projects, zone);
+                    } else {
+                        try header(out, .cyan, "Would add (demo):");
+                        try color.write(out, .gray, "  description: ");
+                        try color.write(out, .bold, desc);
+                        try out.writeByte('\n');
+                        try color.write(out, .gray, "  project: ");
+                        try color.write(out, .cyan, proj_disp);
+                        try out.writeByte('\n');
+                        try color.write(out, .gray, "  tags: ");
+                        try color.write(out, .yellow, tags_disp);
+                        try out.writeByte('\n');
+                        try color.write(out, .gray, "  start: ");
+                        try out.print("{s}\n", .{try timefmt.epochToRfc3339Alloc(arena, se)});
+                        try color.write(out, .gray, "  duration: ");
+                        try out.print("{d}\n", .{duration});
+                    }
+                    return;
+                }
+
                 var fields: api.Client.FullUpdate = .{
                     .description = desc,
                     .project_id = project_id,
@@ -784,10 +904,13 @@ fn editEntry(
 /// keep the current value. Accepts a relative offset (-15m, +1h30m) applied to
 /// the current value, or an absolute *local* time (YYYY-MM-DD HH:MM, or HH:MM
 /// today) which is converted to UTC for the API.
-fn editTime(arena: std.mem.Allocator, io: Io, out: *Io.Writer, zone: localtz.Zone, which: []const u8, current: ?i64) !?i64 {
-    // Use the field's current value (in local time, "YYYY-MM-DD HH:MM") as the
-    // absolute-format example, so it shows both the format and where it's at now.
-    const example: []const u8 = if (current) |c| ex: {
+fn editTime(arena: std.mem.Allocator, io: Io, out: *Io.Writer, zone: localtz.Zone, which: []const u8, current: ?i64, base: ?i64) !?i64 {
+    // Relative offsets and the format example anchor on the field's current
+    // value, falling back to `base` (e.g. the start time for a not-yet-set stop,
+    // so "+1h" still works when there's no current value).
+    const anchor: ?i64 = current orelse base;
+
+    const example: []const u8 = if (anchor) |c| ex: {
         var buf: [32]u8 = undefined;
         const rfc = try timefmt.epochToRfc3339(c + zone.offsetAt(c), &buf);
         const part = try arena.dupe(u8, rfc[0..16]); // "YYYY-MM-DDTHH:MM"
@@ -805,7 +928,7 @@ fn editTime(arena: std.mem.Allocator, io: Io, out: *Io.Writer, zone: localtz.Zon
     if (s.len == 0) return null;
 
     if (s[0] == '+' or s[0] == '-') {
-        const base = current orelse {
+        const anchor_epoch = anchor orelse {
             try color.write(out, .red, "Can't read the current time to offset from.\n");
             return null;
         };
@@ -816,7 +939,7 @@ fn editTime(arena: std.mem.Allocator, io: Io, out: *Io.Writer, zone: localtz.Zon
             try out.writeByte('\n');
             return null;
         };
-        return base + off;
+        return anchor_epoch + off;
     }
 
     return parseAbsoluteLocal(io, zone, s) orelse {
@@ -1109,7 +1232,19 @@ fn cmdEditDemo(arena: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
         .duration = -1, // running
         .tags = &tags,
     };
-    try editEntry(arena, io, out, null, entry, &demo_projects, localtz.load(arena, io));
+    try editEntry(arena, io, out, null, .edit, entry, &demo_projects, localtz.load(arena, io));
+}
+
+/// Hidden command: run the new-entry editor (add mode) over sample data with no
+/// auth/network. Save prints the pending values instead of creating anything.
+fn cmdAddDemo(arena: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
+    const template = api.Client.TimeEntry{
+        .id = 0,
+        .workspace_id = 0,
+        .start = try timefmt.epochToRfc3339Alloc(arena, timefmt.nowUnix(io)),
+        .duration = -1,
+    };
+    try editEntry(arena, io, out, null, .add, template, &demo_projects, localtz.load(arena, io));
 }
 
 // ---- helpers --------------------------------------------------------------

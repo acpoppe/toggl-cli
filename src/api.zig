@@ -243,16 +243,41 @@ pub const Client = struct {
         tags: ?[]const []const u8 = null,
     };
 
+    /// Start a new running entry, beginning now.
     pub fn start(self: *Client, args: StartArgs) !TimeEntry {
-        const wid = try self.workspaceId();
         var start_buf: [32]u8 = undefined;
+        return self.create(.{
+            .description = args.description,
+            .start = try timefmt.nowRfc3339(self.io, &start_buf),
+            .duration = -1, // negative duration == running entry
+            .project_id = args.project_id,
+            .task_id = args.task_id,
+            .tags = args.tags,
+        });
+    }
 
+    pub const CreateArgs = struct {
+        description: []const u8,
+        /// RFC3339 start time.
+        start: []const u8,
+        /// -1 for a running entry, otherwise the length in seconds.
+        duration: i64,
+        project_id: ?i64 = null,
+        task_id: ?i64 = null,
+        tags: ?[]const []const u8 = null,
+    };
+
+    /// Create a time entry with an explicit start + duration. A `duration` of
+    /// -1 makes it running; a positive value logs a completed entry (Toggl
+    /// derives stop = start + duration).
+    pub fn create(self: *Client, args: CreateArgs) !TimeEntry {
+        const wid = try self.workspaceId();
         const Body = struct {
             created_with: []const u8 = "toggl-cli",
             description: []const u8,
             workspace_id: i64,
             start: []const u8,
-            duration: i64 = -1, // negative duration == running entry
+            duration: i64,
             project_id: ?i64 = null,
             task_id: ?i64 = null,
             tags: ?[]const []const u8 = null,
@@ -260,7 +285,8 @@ pub const Client = struct {
         const body = try self.toJson(Body{
             .description = args.description,
             .workspace_id = wid,
-            .start = try timefmt.nowRfc3339(self.io, &start_buf),
+            .start = args.start,
+            .duration = args.duration,
             .project_id = args.project_id,
             .task_id = args.task_id,
             .tags = args.tags,
