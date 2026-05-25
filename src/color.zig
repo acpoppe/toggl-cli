@@ -47,16 +47,16 @@ pub fn isEnabled() bool {
 /// (not a terminal, or the query failed). Uses TIOCGWINSZ directly since 0.16
 /// has no std wrapper; the request value/ioctl ABI differ per OS.
 pub fn width(file: Io.File) ?u16 {
-    var ws: std.posix.winsize = undefined;
+    // Zero-init so a failed ioctl (which leaves the struct untouched) reads as
+    // col==0 → "unknown" — avoids a per-OS errno check (linux's `E` has no
+    // `init`), and the failure outcome is identical either way.
+    var ws: std.posix.winsize = std.mem.zeroes(std.posix.winsize);
     switch (builtin.os.tag) {
-        .linux => {
-            const rc = std.os.linux.ioctl(file.handle, std.os.linux.T.IOCGWINSZ, @intFromPtr(&ws));
-            if (std.os.linux.E.init(rc) != .SUCCESS) return null;
-        },
+        .linux => _ = std.os.linux.ioctl(file.handle, std.os.linux.T.IOCGWINSZ, @intFromPtr(&ws)),
         .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly => {
             // TIOCGWINSZ on Darwin/BSD: _IOR('t', 104, struct winsize).
             const TIOCGWINSZ: c_int = 0x40087468;
-            if (std.c.ioctl(file.handle, TIOCGWINSZ, &ws) != 0) return null;
+            _ = std.c.ioctl(file.handle, TIOCGWINSZ, &ws);
         },
         else => return null,
     }

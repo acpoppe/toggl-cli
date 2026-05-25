@@ -142,12 +142,14 @@ const Term = struct {
 const Size = struct { cols: u16, rows: u16 };
 
 fn winSize(fd: posix.fd_t) Size {
-    var ws: posix.winsize = undefined;
-    const ok = switch (builtin.os.tag) {
-        .linux => std.os.linux.E.init(std.os.linux.ioctl(fd, std.os.linux.T.IOCGWINSZ, @intFromPtr(&ws))) == .SUCCESS,
-        else => std.c.ioctl(fd, 0x40087468, &ws) == 0,
-    };
-    if (!ok or ws.col == 0) return .{ .cols = 120, .rows = 40 };
+    // Zero-init so a failed ioctl reads as col==0 → fallback; avoids a per-OS
+    // errno check (linux's `E` has no `init`).
+    var ws: posix.winsize = std.mem.zeroes(posix.winsize);
+    switch (builtin.os.tag) {
+        .linux => _ = std.os.linux.ioctl(fd, std.os.linux.T.IOCGWINSZ, @intFromPtr(&ws)),
+        else => _ = std.c.ioctl(fd, 0x40087468, &ws),
+    }
+    if (ws.col == 0) return .{ .cols = 120, .rows = 40 };
     return .{ .cols = ws.col, .rows = ws.row };
 }
 
