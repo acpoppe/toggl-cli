@@ -18,6 +18,10 @@ pub const Client = struct {
     auth_header: []const u8,
     /// Cached workspace id. 0 means "not known yet".
     workspace_id: i64 = 0,
+    /// When true, API errors don't print to stderr (the caller will surface
+    /// them). Set by `viz`, which owns the alt-screen and can't have stray
+    /// stderr writes corrupting it.
+    quiet: bool = false,
 
     pub fn init(arena: std.mem.Allocator, io: Io, token: []const u8) !Client {
         // Toggl uses HTTP Basic auth with the API token as the username and the
@@ -100,9 +104,11 @@ pub const Client = struct {
     fn requestChecked(self: *Client, method: std.http.Method, url: []const u8, payload: ?[]const u8) ![]const u8 {
         const res = try self.request(method, url, payload);
         if (!res.ok()) {
-            // Status line in red; leave the (possibly large) body uncolored.
-            color.eprint("Toggl API error: HTTP {d}\n", .{res.status});
-            std.debug.print("{s}\n", .{res.body});
+            if (!self.quiet) {
+                // Status line in red; leave the (possibly large) body uncolored.
+                color.eprint("Toggl API error: HTTP {d}\n", .{res.status});
+                std.debug.print("{s}\n", .{res.body});
+            }
             return error.ApiError;
         }
         return res.body;

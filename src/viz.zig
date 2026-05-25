@@ -203,26 +203,52 @@ fn lookup(projects: []const cache.Entry, pid: i64, tid: ?i64) ProjInfo {
     };
 }
 
-fn blockFromEntry(e: api.Client.TimeEntry, projects: []const cache.Entry, zone: localtz.Zone, week_mon: i64, now: i64) ?Block {
-    const su = if (e.start) |s| (timefmt.parseRfc3339(s) orelse return null) else return null;
-    const di = localDay(su, zone) - week_mon;
-    if (di < 0 or di > 6) return null;
-
-    const slocal = su + zone.offsetAt(su);
-    const smin: u16 = @intCast(@divFloor(@mod(slocal, 86400), 60));
+/// Append one block per local day the entry touches inside the visible week, so
+/// entries that span midnight (or start before the week and run into it) show on
+/// each day, clipped to that day. `dur_secs` is the per-day segment length, so
+/// daily totals stay correct.
+fn appendBlocks(list: *std.ArrayList(Block), arena: std.mem.Allocator, e: api.Client.TimeEntry, projects: []const cache.Entry, zone: localtz.Zone, week_mon: i64, now: i64) !void {
+    const su = if (e.start) |s| (timefmt.parseRfc3339(s) orelse return) else return;
     const running = e.duration < 0;
     const eu = if (running) now else su + e.duration;
-    const dur: i64 = if (eu > su) eu - su else 0;
-    var emin: i64 = @as(i64, smin) + @divFloor(dur, 60);
-    if (emin > 1440) emin = 1440;
-    if (emin <= smin) emin = @as(i64, smin) + 1;
+    if (eu <= su) return;
+
+    const slocal = su + zone.offsetAt(su);
+    const elocal = eu + zone.offsetAt(eu);
+    const start_day = @divFloor(slocal, 86400);
+    const end_day = @divFloor(elocal - 1, 86400); // inclusive last day with content
 
     const desc: []const u8 = if (e.description) |d| (if (d.len > 0) d else "(no description)") else "(no description)";
+    var proj: []const u8 = "(no project)";
+    var rgb = no_project;
     if (e.project_id) |pid| {
         const info = lookup(projects, pid, e.task_id);
-        return .{ .day = @intCast(di), .start_min = smin, .end_min = @intCast(emin), .desc = desc, .project = info.label, .dur_secs = dur, .rgb = info.rgb, .running = running };
+        proj = info.label;
+        rgb = info.rgb;
     }
-    return .{ .day = @intCast(di), .start_min = smin, .end_min = @intCast(emin), .desc = desc, .project = "(no project)", .dur_secs = dur, .rgb = no_project, .running = running };
+
+    var day = @max(start_day, week_mon);
+    const last = @min(end_day, week_mon + 6);
+    while (day <= last) : (day += 1) {
+        const day0 = day * 86400;
+        const seg_start = @max(slocal, day0);
+        const seg_end = @min(elocal, day0 + 86400);
+        if (seg_end <= seg_start) continue;
+        const smin: u16 = @intCast(@divFloor(seg_start - day0, 60));
+        var emin: i64 = @divFloor(seg_end - day0 + 59, 60); // ceil so a partial minute still shows
+        if (emin > 1440) emin = 1440;
+        if (emin <= smin) emin = @as(i64, smin) + 1;
+        try list.append(arena, .{
+            .day = @intCast(day - week_mon),
+            .start_min = smin,
+            .end_min = @intCast(emin),
+            .desc = desc,
+            .project = proj,
+            .dur_secs = seg_end - seg_start,
+            .rgb = rgb,
+            .running = running,
+        });
+    }
 }
 
 fn fetchWeek(arena: std.mem.Allocator, io: Io, client: ?*api.Client, projects: []const cache.Entry, zone: localtz.Zone, week_mon: i64, cur_mon: i64) ![]const Block {
@@ -232,9 +258,7 @@ fn fetchWeek(arena: std.mem.Allocator, io: Io, client: ?*api.Client, projects: [
         const entries = try c.list(sd, ed);
         const now = timefmt.nowUnix(io);
         var list: std.ArrayList(Block) = .empty;
-        for (entries) |e| {
-            if (blockFromEntry(e, projects, zone, week_mon, now)) |b| try list.append(arena, b);
-        }
+        for (entries) |e| try appendBlocks(&list, arena, e, projects, zone, week_mon, now);
         return list.items;
     }
     // Demo: show the sample week only on the current week.
@@ -242,10 +266,21 @@ fn fetchWeek(arena: std.mem.Allocator, io: Io, client: ?*api.Client, projects: [
     return &.{};
 }
 
+/// Write `text` to `w` truncated/padded to `width` columns. Truncation lands on
+/// UTF-8 codepoint boundaries (so multi-byte chars aren't split into mojibake);
+/// each codepoint counts as one column. Wide glyphs (CJK/emoji) may still
+/// under-pad slightly, but no sequence is ever cut mid-character.
 fn padTrunc(w: *Io.Writer, text: []const u8, width: usize) !void {
-    var n: usize = 0;
-    while (n < width and n < text.len) : (n += 1) try w.writeByte(text[n]);
-    while (n < width) : (n += 1) try w.writeByte(' ');
+    var cols: usize = 0;
+    var i: usize = 0;
+    while (i < text.len and cols < width) {
+        const seq = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        const n = @min(@as(usize, seq), text.len - i);
+        try w.writeAll(text[i .. i + n]);
+        i += n;
+        cols += 1;
+    }
+    while (cols < width) : (cols += 1) try w.writeByte(' ');
 }
 
 fn eol(w: *Io.Writer) !void {
@@ -286,7 +321,7 @@ fn renderCell(w: *Io.Writer, b: Block, gr: usize, base: usize, rph: usize, width
     try color.resetRaw(w);
 }
 
-fn render(w: *Io.Writer, io: Io, zone: localtz.Zone, week_mon: i64, blocks: []const Block, size: Size) !void {
+fn render(w: *Io.Writer, io: Io, zone: localtz.Zone, week_mon: i64, blocks: []const Block, size: Size, load_failed: bool) !void {
     try w.writeAll("\x1b[H"); // cursor home
 
     const cols: usize = size.cols;
@@ -456,6 +491,11 @@ fn render(w: *Io.Writer, io: Io, zone: localtz.Zone, week_mon: i64, blocks: []co
     }
 
     // ---- footer ----
+    if (load_failed) {
+        try color.on(w, .red);
+        try w.writeAll("⚠ couldn't load this week (rate-limited or beyond ~90 days)   ");
+        try color.off(w);
+    }
     try color.on(w, .gray);
     try w.writeAll("←/→ or p/n: change week   t: this week   q: quit");
     try color.off(w);
@@ -478,10 +518,14 @@ fn loop(arena: std.mem.Allocator, io: Io, client: ?*api.Client, projects: []cons
         w.flush() catch {};
     }
 
+    // We own the alt-screen, so API errors must not print to stderr over it.
+    if (client) |c| c.quiet = true;
+
     const cur_mon = currentMonday(io, zone);
     var week_mon = cur_mon;
     var need_fetch = true;
     var blocks: []const Block = &.{};
+    var load_failed = false;
     var last: Size = .{ .cols = 0, .rows = 0 };
 
     while (true) {
@@ -491,7 +535,11 @@ fn loop(arena: std.mem.Allocator, io: Io, client: ?*api.Client, projects: []cons
             try w.writeAll("Loading…");
             try color.off(w);
             try w.flush();
-            const fetched = fetchWeek(arena, io, client, projects, zone, week_mon, cur_mon) catch &.{};
+            load_failed = false;
+            const fetched = fetchWeek(arena, io, client, projects, zone, week_mon, cur_mon) catch blk: {
+                load_failed = true;
+                break :blk &.{};
+            };
             const laid = try arena.dupe(Block, fetched); // mutable copy to annotate
             layoutDays(laid); // assign overlap lanes
             blocks = laid;
@@ -500,7 +548,7 @@ fn loop(arena: std.mem.Allocator, io: Io, client: ?*api.Client, projects: []cons
         }
         const size = winSize(term.fd);
         if (size.cols != last.cols or size.rows != last.rows) {
-            try render(w, io, zone, week_mon, blocks, size);
+            try render(w, io, zone, week_mon, blocks, size, load_failed);
             last = size;
         }
 
@@ -585,6 +633,41 @@ test "layoutDays splits overlapping blocks into lanes per cluster" {
     try std.testing.expectEqual(@as(u8, 1), blocks[4].lanes); // E
 }
 
+test "appendBlocks splits an entry spanning midnight into per-day segments" {
+    const a = std.testing.allocator;
+    var list: std.ArrayList(Block) = .empty;
+    defer list.deinit(a);
+    const zone: localtz.Zone = .{}; // UTC (offset 0)
+    const day: i64 = 20000;
+    const su = day * 86400 + 23 * 3600; // 23:00 UTC
+    var buf: [40]u8 = undefined;
+    const start_str = try timefmt.epochToRfc3339(su, &buf);
+    const e = api.Client.TimeEntry{ .id = 1, .start = start_str, .duration = 3 * 3600 }; // ends 02:00 next day
+    try appendBlocks(&list, a, e, &.{}, zone, day, 0);
+
+    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+    try std.testing.expectEqual(@as(u8, 0), list.items[0].day);
+    try std.testing.expectEqual(@as(u16, 1380), list.items[0].start_min); // 23:00
+    try std.testing.expectEqual(@as(u16, 1440), list.items[0].end_min); // 24:00
+    try std.testing.expectEqual(@as(u8, 1), list.items[1].day);
+    try std.testing.expectEqual(@as(u16, 0), list.items[1].start_min); // 00:00
+    try std.testing.expectEqual(@as(u16, 120), list.items[1].end_min); // 02:00
+}
+
+test "padTrunc keeps UTF-8 whole and pads to width" {
+    const a = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try padTrunc(&out.writer, "café", 3); // 'é' is 2 bytes — dropped whole, not split
+    try std.testing.expectEqualStrings("caf", out.written());
+    out.clearRetainingCapacity();
+    try padTrunc(&out.writer, "café", 4); // fits exactly, no padding
+    try std.testing.expectEqualStrings("café", out.written());
+    out.clearRetainingCapacity();
+    try padTrunc(&out.writer, "ab", 4); // short — padded with spaces
+    try std.testing.expectEqualStrings("ab  ", out.written());
+}
+
 fn demoBlocks() []const Block {
     const S = struct {
         const data = [_]Block{
@@ -601,6 +684,10 @@ fn demoBlocks() []const Block {
             .{ .day = 3, .start_min = 1100, .end_min = 1265, .desc = "KLECOPY-590 filter visibility", .project = "Klenico", .dur_secs = 9900, .rgb = teal, .running = false },
             .{ .day = 4, .start_min = 480, .end_min = 615, .desc = "O.Ntwk", .project = "OsteoCoach", .dur_secs = 8100, .rgb = gold, .running = false },
             .{ .day = 4, .start_min = 780, .end_min = 1220, .desc = "KLECOPY-561 Halsana Questionnaire", .project = "Klenico", .dur_secs = 26400, .rgb = teal, .running = true },
+            // A late-night entry spanning midnight (Sat 22:00 → Sun 02:00), shown
+            // as two day-clipped blocks — what the live splitter produces.
+            .{ .day = 5, .start_min = 1320, .end_min = 1440, .desc = "late-night deploy", .project = "devops", .dur_secs = 7200, .rgb = slate, .running = false },
+            .{ .day = 6, .start_min = 0, .end_min = 120, .desc = "late-night deploy", .project = "devops", .dur_secs = 7200, .rgb = slate, .running = false },
         };
     };
     return &S.data;
