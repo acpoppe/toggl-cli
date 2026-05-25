@@ -12,6 +12,9 @@ pub const Entry = struct {
     label: []const u8,
     project_id: i64,
     task_id: ?i64 = null,
+    /// The project's Toggl hex color (e.g. "#0b83d9"); empty if unknown. Used by
+    /// `toggl viz` to color blocks the same as the web UI.
+    color: []const u8 = "",
 };
 
 /// The on-disk cache document.
@@ -72,6 +75,7 @@ pub fn build(arena: std.mem.Allocator, client: *api.Client) ![]Entry {
             .label = try projectLabel(arena, clients, p),
             .project_id = p.id,
             .task_id = null,
+            .color = p.color,
         });
     }
 
@@ -83,6 +87,7 @@ pub fn build(arena: std.mem.Allocator, client: *api.Client) ![]Entry {
             .label = try std.fmt.allocPrint(arena, "{s} / {s}", .{ plabel, t.name }),
             .project_id = t.project_id,
             .task_id = t.id,
+            .color = p.color, // tasks inherit their project's color
         });
     }
 

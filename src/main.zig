@@ -8,6 +8,7 @@ const cache = @import("cache.zig");
 const picker = @import("picker.zig");
 const localtz = @import("localtz.zig");
 const color = @import("color.zig");
+const viz = @import("viz.zig");
 const build_options = @import("build_options");
 
 const usage =
@@ -22,6 +23,7 @@ const usage =
     \\  toggl update [opts]                Edit an entry (interactive, or running with flags)
     \\  toggl add                          Add a new entry (interactive editor)
     \\  toggl delete                       Delete an entry (interactive, confirms first)
+    \\  toggl viz                          Full-screen week calendar (paginate weeks)
     \\  toggl list [count]                 List recent entries (default 10)
     \\  toggl sync                         Refresh the cached project/task list
     \\  toggl version                      Print the version (also --version)
@@ -161,6 +163,24 @@ const help_delete =
     \\
 ;
 
+const help_viz =
+    \\toggl viz
+    \\
+    \\A full-screen week calendar of your time entries — days as columns, hours
+    \\as rows, each entry a filled block in its Toggl project color. The view
+    \\fills your terminal and re-renders when you resize the window.
+    \\
+    \\Keys:
+    \\  ← / →   or  p / n   previous / next week
+    \\  t                   jump to the current week
+    \\  q / Esc             quit
+    \\
+    \\Project colors come from Toggl (run `toggl sync` to refresh them). Needs a
+    \\color terminal; truecolor is used when available, otherwise the nearest
+    \\256- or 16-color match.
+    \\
+;
+
 const help_list =
     \\toggl list [count]          (alias: ls)
     \\
@@ -195,6 +215,7 @@ pub fn main(init: std.process.Init) !void {
     // Decide once whether to colorize, based on each stream + the environment.
     color.detect(io, Io.File.stdout(), env);
     color.detectErr(io, Io.File.stderr(), env);
+    color.detectDepth(env);
 
     run(arena, io, env, out, args) catch |err| {
         // Domain errors already printed a helpful message; anything else is
@@ -271,6 +292,8 @@ fn run(
         try cmdAdd(arena, io, env, out);
     } else if (eql(cmd, "delete") or eql(cmd, "rm")) {
         try cmdDelete(arena, io, env, out);
+    } else if (eql(cmd, "viz")) {
+        try cmdViz(arena, io, env, out);
     } else if (eql(cmd, "list") or eql(cmd, "ls")) {
         try cmdList(arena, io, env, out, rest);
     } else if (eql(cmd, "sync")) {
@@ -281,6 +304,8 @@ fn run(
         try cmdEditDemo(arena, io, out);
     } else if (eql(cmd, "adddemo")) {
         try cmdAddDemo(arena, io, out);
+    } else if (eql(cmd, "vizdemo")) {
+        try cmdVizDemo(arena, io, out);
     } else {
         color.eprint("unknown command: {s}\n\n", .{cmd});
         try out.writeAll(usage);
@@ -299,6 +324,7 @@ fn commandHelp(cmd: []const u8) ?[]const u8 {
     if (eql(cmd, "update")) return help_update;
     if (eql(cmd, "add")) return help_add;
     if (eql(cmd, "delete") or eql(cmd, "rm")) return help_delete;
+    if (eql(cmd, "viz")) return help_viz;
     if (eql(cmd, "list") or eql(cmd, "ls")) return help_list;
     if (eql(cmd, "sync")) return help_sync;
     return null;
@@ -1245,6 +1271,41 @@ fn cmdAddDemo(arena: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
         .duration = -1,
     };
     try editEntry(arena, io, out, null, .add, template, &demo_projects, localtz.load(arena, io));
+}
+
+/// `toggl viz` — full-screen week calendar of your entries, colored by project.
+fn cmdViz(
+    arena: std.mem.Allocator,
+    io: Io,
+    env: *std.process.Environ.Map,
+    out: *Io.Writer,
+) !void {
+    _ = out;
+    var client = try makeClient(arena, io, env);
+    defer client.deinit();
+
+    const projects = try ensureCache(arena, io, env, &client);
+    const zone = localtz.load(arena, io);
+
+    viz.run(arena, io, &client, projects, zone) catch |err| switch (err) {
+        error.NoTerminal => {
+            color.eprint("viz needs an interactive terminal.\n", .{});
+            return error.Usage;
+        },
+        else => return err,
+    };
+}
+
+/// Hidden command: the week calendar over sample data, no auth/network.
+fn cmdVizDemo(arena: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
+    _ = out;
+    viz.runDemo(arena, io, localtz.load(arena, io)) catch |err| switch (err) {
+        error.NoTerminal => {
+            color.eprint("viz needs an interactive terminal.\n", .{});
+            return error.Usage;
+        },
+        else => return err,
+    };
 }
 
 // ---- helpers --------------------------------------------------------------

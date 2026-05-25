@@ -159,6 +159,8 @@ pub const Client = struct {
         name: []const u8 = "",
         client_id: ?i64 = null,
         active: bool = true,
+        /// Hex color (e.g. "#0b83d9"), as shown in the Toggl web UI.
+        color: []const u8 = "",
     };
 
     pub const Task = struct {
