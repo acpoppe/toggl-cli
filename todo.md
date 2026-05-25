@@ -1,2 +1,3 @@
 - delete entries
 - add entries
+- toggl viz

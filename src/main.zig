@@ -20,6 +20,7 @@ const usage =
     \\  toggl stop                         Stop the currently running entry
     \\  toggl status                       Show the currently running entry
     \\  toggl update [opts]                Edit an entry (interactive, or running with flags)
+    \\  toggl delete                       Delete an entry (interactive, confirms first)
     \\  toggl list [count]                 List recent entries (default 10)
     \\  toggl sync                         Refresh the cached project/task list
     \\  toggl version                      Print the version (also --version)
@@ -133,6 +134,17 @@ const help_update =
     \\
 ;
 
+const help_delete =
+    \\toggl delete        (alias: rm)
+    \\
+    \\Permanently delete a time entry. Opens a fuzzy picker of your recent (and
+    \\running) entries — the same chooser as `toggl update` — then shows the
+    \\chosen entry and asks for confirmation before deleting it.
+    \\
+    \\Deletion cannot be undone.
+    \\
+;
+
 const help_list =
     \\toggl list [count]          (alias: ls)
     \\
@@ -239,6 +251,8 @@ fn run(
         try cmdStatus(arena, io, env, out);
     } else if (eql(cmd, "update")) {
         try cmdUpdate(arena, io, env, out, rest);
+    } else if (eql(cmd, "delete") or eql(cmd, "rm")) {
+        try cmdDelete(arena, io, env, out);
     } else if (eql(cmd, "list") or eql(cmd, "ls")) {
         try cmdList(arena, io, env, out, rest);
     } else if (eql(cmd, "sync")) {
@@ -263,6 +277,7 @@ fn commandHelp(cmd: []const u8) ?[]const u8 {
     if (eql(cmd, "stop")) return help_stop;
     if (eql(cmd, "status") or eql(cmd, "current")) return help_status;
     if (eql(cmd, "update")) return help_update;
+    if (eql(cmd, "delete") or eql(cmd, "rm")) return help_delete;
     if (eql(cmd, "list") or eql(cmd, "ls")) return help_list;
     if (eql(cmd, "sync")) return help_sync;
     return null;
@@ -516,6 +531,28 @@ fn interactiveUpdate(
     client: *api.Client,
     out: *Io.Writer,
 ) !void {
+    const sel = try pickEntry(arena, io, env, client, out, "Pick an entry to edit — type to filter, ^J/^K or arrows move, Enter select, Esc cancel") orelse return;
+    try editEntry(arena, io, out, client, sel.entry, sel.projects, sel.zone);
+}
+
+/// A chosen entry plus the context needed to display/act on it.
+const EntrySelection = struct {
+    entry: api.Client.TimeEntry,
+    projects: []const cache.Entry,
+    zone: localtz.Zone,
+};
+
+/// Present the recent + running entries in a fuzzy picker and return the chosen
+/// one (shared by `update` and `delete`). Prints a message and returns null
+/// when there's nothing to pick or the user cancels.
+fn pickEntry(
+    arena: std.mem.Allocator,
+    io: Io,
+    env: *std.process.Environ.Map,
+    client: *api.Client,
+    out: *Io.Writer,
+    title: []const u8,
+) !?EntrySelection {
     // Project/task list — drives both the labels and the project sub-picker.
     const projects = try ensureCache(arena, io, env, client);
     const zone = localtz.load(arena, io);
@@ -531,22 +568,51 @@ fn interactiveUpdate(
         try entries.append(arena, e);
     }
     if (entries.items.len == 0) {
-        try color.write(out, .dim, "No entries to edit.\n");
-        return;
+        try color.write(out, .dim, "No entries found.\n");
+        return null;
     }
 
     const labels = try arena.alloc([]const u8, entries.items.len);
     for (entries.items, 0..) |e, i| labels[i] = try entryLabel(arena, io, e, projects, zone);
 
     const idx = try picker.pickIndex(arena, io, labels, .{
-        .title = "Pick an entry to edit — type to filter, ^J/^K or arrows move, Enter select, Esc cancel",
+        .title = title,
         .show_filter = true,
     }) orelse {
         try color.write(out, .dim, "Cancelled.\n");
-        return;
+        return null;
     };
 
-    try editEntry(arena, io, out, client, entries.items[idx], projects, zone);
+    return .{ .entry = entries.items[idx], .projects = projects, .zone = zone };
+}
+
+/// Pick an entry (recent or running) and, after confirmation, permanently
+/// delete it. Deletion is irreversible, so it always confirms first.
+fn cmdDelete(
+    arena: std.mem.Allocator,
+    io: Io,
+    env: *std.process.Environ.Map,
+    out: *Io.Writer,
+) !void {
+    var client = try makeClient(arena, io, env);
+    defer client.deinit();
+
+    const sel = try pickEntry(arena, io, env, &client, out, "Pick an entry to DELETE — type to filter, ^J/^K or arrows move, Enter select, Esc cancel") orelse return;
+
+    // Show exactly what's about to go, then confirm.
+    try header(out, .red, "Delete this entry?");
+    try printEntry(io, out, sel.entry, sel.projects, sel.zone);
+    try out.flush();
+
+    const ok = try picker.confirm(io, "Delete permanently? [y/N] ");
+    if (!(ok orelse false)) {
+        try color.write(out, .dim, "Not deleted.\n");
+        return;
+    }
+
+    try client.delete(sel.entry.workspace_id, sel.entry.id);
+    try header(out, .red, "Deleted:");
+    try printEntry(io, out, sel.entry, sel.projects, sel.zone);
 }
 
 /// The field-menu editor for a single entry. `client` is optional: when null

@@ -351,4 +351,15 @@ pub const Client = struct {
         );
         return self.parse(TimeEntry, resp);
     }
+
+    /// Permanently delete a time entry. `workspace_id` is the entry's own
+    /// workspace (falls back to the default if 0). DELETE has no body.
+    pub fn delete(self: *Client, workspace_id: i64, entry_id: i64) !void {
+        const wid = if (workspace_id != 0) workspace_id else try self.workspaceId();
+        _ = try self.requestChecked(
+            .DELETE,
+            try self.buildUrl("/workspaces/{d}/time_entries/{d}", .{ wid, entry_id }),
+            null,
+        );
+    }
 };
