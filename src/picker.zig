@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const posix = std.posix;
 const cache = @import("cache.zig");
+const color = @import("color.zig");
 
 /// Max list rows shown at once (window into the filtered results).
 const max_rows: usize = 12;
@@ -160,7 +161,11 @@ pub fn pickIndex(arena: std.mem.Allocator, io: Io, items: []const []const u8, op
 pub fn pick(arena: std.mem.Allocator, io: Io, entries: []const cache.Entry, initial_filter: []const u8) !?cache.Entry {
     if (entries.len == 0) return null;
     const labels = try arena.alloc([]const u8, entries.len);
-    for (entries, 0..) |e, i| labels[i] = e.label;
+    for (entries, 0..) |e, i| {
+        var lb: Io.Writer.Allocating = .init(arena);
+        try color.write(&lb.writer, .cyan, e.label);
+        labels[i] = lb.written();
+    }
     const idx = try pickIndex(arena, io, labels, .{
         .title = "Pick a project — type to filter, ^J/^K or arrows move, Enter select, Esc skip",
         .show_filter = true,
@@ -193,7 +198,10 @@ pub fn readLine(arena: std.mem.Allocator, io: Io, prompt: []const u8, initial: [
     while (true) {
         // Redraw the single line and place the cursor.
         try w.writeAll("\r\x1b[2K");
-        try w.print("{s}{s}\r", .{ prompt, buf.items });
+        try color.on(w, .bold);
+        try w.writeAll(prompt);
+        try color.off(w);
+        try w.print("{s}\r", .{buf.items});
         const col = prompt.len + cursor;
         if (col > 0) try w.print("\x1b[{d}C", .{col});
         try w.flush();
@@ -293,7 +301,13 @@ fn render(
 
     var lines: usize = 0;
 
-    try w.print("{s}  ({d})\n", .{ opts.title, matches.len });
+    try color.on(w, .bold);
+    try w.writeAll(opts.title);
+    try color.off(w);
+    try color.on(w, .gray);
+    try w.print("  ({d})", .{matches.len});
+    try color.off(w);
+    try w.writeByte('\n');
     lines += 1;
     if (opts.show_filter) {
         try w.print("\x1b[1m> \x1b[0m{s}\n", .{filter});
@@ -301,7 +315,7 @@ fn render(
     }
 
     if (matches.len == 0) {
-        try w.writeAll("  (no matches)\n");
+        try color.write(w, .dim, "  (no matches)\n");
         lines += 1;
     } else {
         const visible = @min(max_rows, matches.len - offset);
@@ -310,7 +324,12 @@ fn render(
             const mi = offset + i;
             const label = items[matches[mi]];
             if (mi == selected) {
-                try w.print("\x1b[7m> {s}\x1b[0m\n", .{label});
+                // Reverse-video selection bar. Strip the label's own color
+                // codes first, so an embedded reset can't cancel the highlight
+                // partway across the row.
+                try w.writeAll("\x1b[7m> ");
+                try writeStripped(w, label);
+                try w.writeAll("\x1b[0m\n");
             } else {
                 try w.print("  {s}\n", .{label});
             }
@@ -322,11 +341,42 @@ fn render(
     return lines;
 }
 
+/// Write `s` to `w` with any ANSI escape sequences (ESC `[` … final-byte)
+/// removed. Used to render the selected row as a clean reverse-video bar even
+/// when the label carries its own colors.
+fn writeStripped(w: *Io.Writer, s: []const u8) !void {
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == 0x1b and i + 1 < s.len and s[i + 1] == '[') {
+            i += 2;
+            // Skip until the sequence's final byte (0x40–0x7e), e.g. 'm'.
+            while (i < s.len and (s[i] < 0x40 or s[i] > 0x7e)) : (i += 1) {}
+            if (i < s.len) i += 1; // consume the final byte
+        } else {
+            try w.writeByte(s[i]);
+            i += 1;
+        }
+    }
+}
+
 /// Erase the rendered frame, leaving the cursor where the picker started.
 fn clearFrame(w: *Io.Writer, prev_lines: usize) !void {
     if (prev_lines > 0) try w.print("\x1b[{d}A", .{prev_lines});
     try w.writeAll("\r\x1b[0J");
     try w.flush();
+}
+
+test "writeStripped removes ANSI escape sequences" {
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    // Mixed styled text: bold + cyan label, reset, plain tail.
+    try writeStripped(&out.writer, "\x1b[1m\x1b[36mAcme / Backend\x1b[0m — running 5m");
+    try std.testing.expectEqualStrings("Acme / Backend — running 5m", out.written());
+
+    // No escapes: passes through unchanged.
+    out.clearRetainingCapacity();
+    try writeStripped(&out.writer, "plain text");
+    try std.testing.expectEqualStrings("plain text", out.written());
 }
 
 test "fuzzyMatch is a case-insensitive subsequence" {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const timefmt = @import("timefmt.zig");
+const color = @import("color.zig");
 
 const base_url = "https://api.track.toggl.com/api/v9";
 const user_agent = "toggl-cli (https://github.com/)";
@@ -99,7 +100,9 @@ pub const Client = struct {
     fn requestChecked(self: *Client, method: std.http.Method, url: []const u8, payload: ?[]const u8) ![]const u8 {
         const res = try self.request(method, url, payload);
         if (!res.ok()) {
-            std.debug.print("Toggl API error: HTTP {d}\n{s}\n", .{ res.status, res.body });
+            // Status line in red; leave the (possibly large) body uncolored.
+            color.eprint("Toggl API error: HTTP {d}\n", .{res.status});
+            std.debug.print("{s}\n", .{res.body});
             return error.ApiError;
         }
         return res.body;

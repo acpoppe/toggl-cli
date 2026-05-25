@@ -7,6 +7,7 @@ const timefmt = @import("timefmt.zig");
 const cache = @import("cache.zig");
 const picker = @import("picker.zig");
 const localtz = @import("localtz.zig");
+const color = @import("color.zig");
 const build_options = @import("build_options");
 
 const usage =
@@ -149,12 +150,16 @@ pub fn main(init: std.process.Init) !void {
     var stdout_fw: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const out = &stdout_fw.interface;
 
+    // Decide once whether to colorize, based on each stream + the environment.
+    color.detect(io, Io.File.stdout(), env);
+    color.detectErr(io, Io.File.stderr(), env);
+
     run(arena, io, env, out, args) catch |err| {
         // Domain errors already printed a helpful message; anything else is
         // unexpected, so surface it.
         switch (err) {
             error.ApiError, error.NoToken, error.Usage => {},
-            else => std.debug.print("error: {s}\n", .{@errorName(err)}),
+            else => color.eprint("error: {s}\n", .{@errorName(err)}),
         }
         out.flush() catch {};
         std.process.exit(1);
@@ -178,7 +183,10 @@ fn run(
     const rest = args[2..];
 
     if (eql(cmd, "version") or eql(cmd, "--version") or eql(cmd, "-v")) {
-        try out.print("toggl {s}\n", .{build_options.version});
+        try color.on(out, .bold);
+        try out.print("toggl {s}", .{build_options.version});
+        try color.off(out);
+        try out.writeByte('\n');
         return;
     }
 
@@ -189,7 +197,7 @@ fn run(
         } else if (commandHelp(rest[0])) |h| {
             try out.writeAll(h);
         } else {
-            std.debug.print("unknown command: {s}\n\n", .{rest[0]});
+            color.eprint("unknown command: {s}\n\n", .{rest[0]});
             try out.writeAll(usage);
             return error.Usage;
         }
@@ -224,7 +232,7 @@ fn run(
     } else if (eql(cmd, "editdemo")) {
         try cmdEditDemo(arena, io, out);
     } else {
-        std.debug.print("unknown command: {s}\n\n", .{cmd});
+        color.eprint("unknown command: {s}\n\n", .{cmd});
         try out.writeAll(usage);
         return error.Usage;
     }
@@ -261,7 +269,7 @@ fn cmdAuth(
     rest: []const [:0]const u8,
 ) !void {
     if (rest.len < 1) {
-        std.debug.print("usage: toggl auth <api_token>\n", .{});
+        color.eprint("usage: toggl auth <api_token>\n", .{});
         return error.Usage;
     }
     const token = rest[0];
@@ -278,9 +286,14 @@ fn cmdAuth(
     });
 
     const who = me.fullname orelse "your account";
-    try out.print("Authenticated as {s}.\n", .{who});
+    try color.on(out, .green);
+    try out.print("Authenticated as {s}.", .{who});
+    try color.off(out);
+    try out.writeByte('\n');
+    try color.on(out, .gray);
     try out.print("Default workspace: {d}\n", .{me.default_workspace_id});
     try out.print("Saved to {s}\n", .{config.displayPath(arena, env)});
+    try color.off(out);
 }
 
 fn cmdStart(
@@ -294,7 +307,7 @@ fn cmdStart(
 
     const description = opts.description orelse blk: {
         if (opts.positionals.items.len == 0) {
-            std.debug.print("usage: toggl start <description> [-p <project>] [-t <tag>]...\n", .{});
+            color.eprint("usage: toggl start <description> [-p <project>] [-t <tag>]...\n", .{});
             return error.Usage;
         }
         break :blk try std.mem.join(arena, " ", opts.positionals.items);
@@ -315,7 +328,7 @@ fn cmdStart(
 
     const labels = loadLabels(arena, io, env);
     const zone = localtz.load(arena, io);
-    try out.writeAll("Started:\n");
+    try header(out, .green, "Started:");
     try printEntry(io, out, entry, labels, zone);
 }
 
@@ -329,14 +342,14 @@ fn cmdStop(
     defer client.deinit();
 
     const running = try client.current() orelse {
-        try out.writeAll("Nothing is running.\n");
+        try color.write(out, .dim, "Nothing is running.\n");
         return;
     };
 
     const stopped = try client.stop(running.id);
     const labels = loadLabels(arena, io, env);
     const zone = localtz.load(arena, io);
-    try out.writeAll("Stopped:\n");
+    try header(out, .red, "Stopped:");
     try printEntry(io, out, stopped, labels, zone);
 }
 
@@ -350,13 +363,13 @@ fn cmdStatus(
     defer client.deinit();
 
     const running = try client.current() orelse {
-        try out.writeAll("Nothing is running.\n");
+        try color.write(out, .dim, "Nothing is running.\n");
         return;
     };
 
     const labels = loadLabels(arena, io, env);
     const zone = localtz.load(arena, io);
-    try out.writeAll("Running:\n");
+    try header(out, .green, "Running:");
     try printEntry(io, out, running, labels, zone);
 }
 
@@ -388,7 +401,7 @@ fn cmdUpdate(
     }
 
     const running = try client.current() orelse {
-        try out.writeAll("Nothing is running. Run `toggl update` with no flags to pick a past entry.\n");
+        try color.write(out, .dim, "Nothing is running. Run `toggl update` with no flags to pick a past entry.\n");
         return;
     };
 
@@ -402,7 +415,7 @@ fn cmdUpdate(
     });
     const labels = loadLabels(arena, io, env);
     const zone = localtz.load(arena, io);
-    try out.writeAll("Updated:\n");
+    try header(out, .yellow, "Updated:");
     try printEntry(io, out, updated, labels, zone);
 }
 
@@ -430,7 +443,7 @@ fn interactiveUpdate(
         try entries.append(arena, e);
     }
     if (entries.items.len == 0) {
-        try out.writeAll("No entries to edit.\n");
+        try color.write(out, .dim, "No entries to edit.\n");
         return;
     }
 
@@ -441,7 +454,7 @@ fn interactiveUpdate(
         .title = "Pick an entry to edit — type to filter, ^J/^K or arrows move, Enter select, Esc cancel",
         .show_filter = true,
     }) orelse {
-        try out.writeAll("Cancelled.\n");
+        try color.write(out, .dim, "Cancelled.\n");
         return;
     };
 
@@ -482,28 +495,34 @@ fn editEntry(
 
         var labels: std.ArrayList([]const u8) = .empty;
         var actions: std.ArrayList(Action) = .empty;
-        try labels.append(arena, try std.fmt.allocPrint(arena, "Description:  {s}", .{if (desc.len == 0) "(empty)" else desc}));
+        try labels.append(arena, if (desc.len == 0)
+            try fieldRowMissing(arena, "Description:  ", "(empty)")
+        else
+            try fieldRow(arena, "Description:  ", desc, .bold));
         try actions.append(arena, .description);
-        try labels.append(arena, try std.fmt.allocPrint(arena, "Project:      {s}", .{proj_disp}));
+        try labels.append(arena, if (project_id == null)
+            try fieldRowMissing(arena, "Project:      ", "(none)")
+        else
+            try fieldRow(arena, "Project:      ", proj_disp, .cyan));
         try actions.append(arena, .project);
-        try labels.append(arena, try std.fmt.allocPrint(arena, "Tags:         {s}", .{tags_disp}));
+        try labels.append(arena, try fieldRow(arena, "Tags:         ", tags_disp, .yellow));
         try actions.append(arena, .tags);
-        try labels.append(arena, try std.fmt.allocPrint(arena, "Start time:   {s}", .{try fmtStart(arena, io, zone, start_epoch, running)}));
+        try labels.append(arena, try fieldRow(arena, "Start time:   ", try fmtStart(arena, io, zone, start_epoch, running), null));
         try actions.append(arena, .start);
         if (!running) {
-            try labels.append(arena, try std.fmt.allocPrint(arena, "Stop time:    {s}", .{try fmtInstant(arena, zone, stop_epoch)}));
+            try labels.append(arena, try fieldRow(arena, "Stop time:    ", try fmtInstant(arena, zone, stop_epoch), null));
             try actions.append(arena, .stop);
         }
-        try labels.append(arena, "Save changes");
+        try labels.append(arena, try styled(arena, .green, "Save changes"));
         try actions.append(arena, .save);
-        try labels.append(arena, "Cancel");
+        try labels.append(arena, try styled(arena, .dim, "Cancel"));
         try actions.append(arena, .cancel);
 
         const choice = try picker.pickIndex(arena, io, labels.items, .{
             .title = "Editing entry — j/k or arrows move, Enter select, Esc cancel",
             .show_filter = false,
         }) orelse {
-            try out.writeAll("No changes saved.\n");
+            try color.write(out, .dim, "No changes saved.\n");
             return;
         };
 
@@ -514,7 +533,7 @@ fn editEntry(
             .project => { // Esc in the sub-picker keeps the current project
                 if (projects.len > 0) {
                     const plabels = try arena.alloc([]const u8, projects.len);
-                    for (projects, 0..) |p, i| plabels[i] = p.label;
+                    for (projects, 0..) |p, i| plabels[i] = try styled(arena, .cyan, p.label);
                     if (try picker.pickIndex(arena, io, plabels, .{
                         .title = "Pick a project — type to filter, ^J/^K or arrows move, Enter select, Esc keep",
                         .show_filter = true,
@@ -564,7 +583,7 @@ fn editEntry(
                     } else if (start_epoch) |se| {
                         if (stop_epoch) |pe| {
                             if (pe <= se) {
-                                try out.writeAll("Stop must be after start — adjust the times and try again.\n");
+                                try color.write(out, .red, "Stop must be after start — adjust the times and try again.\n");
                                 try out.flush();
                                 continue; // keep edits, back to the menu
                             }
@@ -575,20 +594,32 @@ fn editEntry(
 
                 if (client) |c| {
                     const updated = try c.updateFields(entry.workspace_id, entry.id, fields);
-                    try out.writeAll("Updated:\n");
+                    try header(out, .yellow, "Updated:");
                     try printEntry(io, out, updated, projects, zone);
                 } else {
-                    try out.writeAll("Would save (demo):\n");
-                    try out.print("  description: {s}\n", .{desc});
-                    try out.print("  project: {s}\n", .{proj_disp});
-                    try out.print("  tags: {s}\n", .{tags_disp});
-                    if (fields.start) |s| try out.print("  start: {s}\n", .{s});
-                    if (fields.duration) |d| try out.print("  duration: {d}\n", .{d});
+                    try header(out, .cyan, "Would save (demo):");
+                    try color.write(out, .gray, "  description: ");
+                    try color.write(out, .bold, desc);
+                    try out.writeByte('\n');
+                    try color.write(out, .gray, "  project: ");
+                    try color.write(out, .cyan, proj_disp);
+                    try out.writeByte('\n');
+                    try color.write(out, .gray, "  tags: ");
+                    try color.write(out, .yellow, tags_disp);
+                    try out.writeByte('\n');
+                    if (fields.start) |s| {
+                        try color.write(out, .gray, "  start: ");
+                        try out.print("{s}\n", .{s});
+                    }
+                    if (fields.duration) |d| {
+                        try color.write(out, .gray, "  duration: ");
+                        try out.print("{d}\n", .{d});
+                    }
                 }
                 return;
             },
             .cancel => {
-                try out.writeAll("No changes saved.\n");
+                try color.write(out, .dim, "No changes saved.\n");
                 return;
             },
         }
@@ -621,18 +652,24 @@ fn editTime(arena: std.mem.Allocator, io: Io, out: *Io.Writer, zone: localtz.Zon
 
     if (s[0] == '+' or s[0] == '-') {
         const base = current orelse {
-            try out.writeAll("Can't read the current time to offset from.\n");
+            try color.write(out, .red, "Can't read the current time to offset from.\n");
             return null;
         };
         const off = parseOffsetSeconds(s) orelse {
-            try out.print("Couldn't parse offset '{s}'.\n", .{s});
+            try color.on(out, .red);
+            try out.print("Couldn't parse offset '{s}'.", .{s});
+            try color.off(out);
+            try out.writeByte('\n');
             return null;
         };
         return base + off;
     }
 
     return parseAbsoluteLocal(io, zone, s) orelse {
-        try out.print("Couldn't parse time '{s}'.\n", .{s});
+        try color.on(out, .red);
+        try out.print("Couldn't parse time '{s}'.", .{s});
+        try color.off(out);
+        try out.writeByte('\n');
         return null;
     };
 }
@@ -732,23 +769,61 @@ fn fmtStart(arena: std.mem.Allocator, io: Io, zone: localtz.Zone, epoch: ?i64, r
     return std.fmt.allocPrint(arena, "{s}  ({d}h{d:0>2}m ago)", .{ inst, @divTrunc(mins, 60), @mod(mins, 60) });
 }
 
-/// A one-line description of a time entry for the chooser list.
+/// A one-line, colored description of a time entry for the chooser list.
 fn entryLabel(arena: std.mem.Allocator, io: Io, e: api.Client.TimeEntry, projects: []const cache.Entry, zone: localtz.Zone) ![]const u8 {
-    const desc = e.description orelse "(no description)";
-    const proj = lookupLabel(projects, e.project_id orelse -1, e.task_id) orelse "(no project)";
+    // A non-empty description / resolvable project name, or null when missing.
+    const desc: ?[]const u8 = if (e.description) |d| (if (d.len > 0) d else null) else null;
+    const proj: ?[]const u8 = if (e.project_id) |pid| lookupLabel(projects, pid, e.task_id) else null;
+
+    var out: Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
 
     if (e.duration < 0) {
         const start_epoch: ?i64 = if (e.start) |s| timefmt.parseRfc3339(s) else null;
         const elapsed = if (start_epoch) |se| timefmt.nowUnix(io) - se else timefmt.nowUnix(io) + e.duration;
         const mins = @divTrunc(if (elapsed < 0) 0 else elapsed, 60);
-        return std.fmt.allocPrint(arena, "* {s} — {s} — running {d}m", .{ desc, proj, mins });
+        try color.write(w, .green, "* ");
+        try writeDescProj(w, desc, proj);
+        try color.on(w, .green);
+        try w.print(" — running {d}m", .{mins});
+        try color.off(w);
+        return out.written();
     }
 
     const when = if (e.start) |s|
         (if (timefmt.parseRfc3339(s)) |se| try localtz.fmtLocal(arena, zone, se) else "")
     else
         "";
-    return std.fmt.allocPrint(arena, "  {s} — {s} — {s}", .{ desc, proj, when });
+    try w.writeAll("  ");
+    try writeDescProj(w, desc, proj);
+    try color.write(w, .gray, " — ");
+    try color.write(w, .gray, when);
+    return out.written();
+}
+
+/// Write "<desc> — <project>" for a chooser row: bold description / cyan
+/// project, or the short red placeholders when either is missing.
+fn writeDescProj(w: *Io.Writer, desc: ?[]const u8, proj: ?[]const u8) !void {
+    if (desc) |d| try color.write(w, .bold, d) else try missing(w, "(no description)");
+    try color.write(w, .gray, " — ");
+    if (proj) |p| try color.write(w, .cyan, p) else try missing(w, "(no project)");
+}
+
+/// Build an arena-owned string of `text` in `style` (plain when color is off).
+fn styled(arena: std.mem.Allocator, style: color.Style, text: []const u8) ![]const u8 {
+    var out: Io.Writer.Allocating = .init(arena);
+    try color.write(&out.writer, style, text);
+    return out.written();
+}
+
+/// Build a "<label><value>" editor-menu row: gray label, optionally styled
+/// value (null = leave the value uncolored).
+fn fieldRow(arena: std.mem.Allocator, label: []const u8, value: []const u8, value_style: ?color.Style) ![]const u8 {
+    var out: Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    try color.write(w, .gray, label);
+    if (value_style) |s| try color.write(w, s, value) else try w.writeAll(value);
+    return out.written();
 }
 
 fn cmdList(
@@ -760,7 +835,7 @@ fn cmdList(
 ) !void {
     const count: usize = if (rest.len > 0)
         std.fmt.parseInt(usize, rest[0], 10) catch {
-            std.debug.print("usage: toggl list [count]\n", .{});
+            color.eprint("usage: toggl list [count]\n", .{});
             return error.Usage;
         }
     else
@@ -779,7 +854,7 @@ fn cmdList(
 
     const entries = try client.list(start_date, end_date);
     if (entries.len == 0) {
-        try out.writeAll("No recent entries.\n");
+        try color.write(out, .dim, "No recent entries.\n");
         return;
     }
 
@@ -795,8 +870,16 @@ fn cmdList(
     const labels = loadLabels(arena, io, env);
     const zone = localtz.load(arena, io);
     const shown = entries[0..@min(count, entries.len)];
-    try out.print("Recent entries (showing {d} of {d}):\n", .{ shown.len, entries.len });
-    for (shown) |entry| try printEntry(io, out, entry, labels, zone);
+    try color.on(out, .bold);
+    try color.on(out, .cyan);
+    try out.print("Recent entries (showing {d} of {d}):", .{ shown.len, entries.len });
+    try color.off(out);
+    try out.writeByte('\n');
+    const cols = color.width(Io.File.stdout()) orelse 48;
+    for (shown, 0..) |entry, i| {
+        if (i != 0) try divider(out, cols);
+        try printEntry(io, out, entry, labels, zone);
+    }
 }
 
 /// "YYYY-MM-DD" (UTC) for a Unix timestamp, for the list date-range query.
@@ -817,7 +900,10 @@ fn cmdSync(
 
     const entries = try cache.build(arena, &client);
     try cache.save(arena, io, env, .{ .synced_at = timefmt.nowUnix(io), .entries = entries });
-    try out.print("Synced {d} project/task entries.\n", .{entries.len});
+    try color.on(out, .green);
+    try out.print("Synced {d} project/task entries.", .{entries.len});
+    try color.off(out);
+    try out.writeByte('\n');
 }
 
 /// Sample project/task entries for the offline demo commands.
@@ -846,9 +932,12 @@ const demo_projects = [_]cache.Entry{
 fn cmdPickDemo(arena: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
     const choice = try picker.pick(arena, io, &demo_projects, "");
     if (choice) |c| {
-        try out.print("Selected: {s}  (project_id={d}, task_id={?d})\n", .{ c.label, c.project_id, c.task_id });
+        try color.on(out, .green);
+        try out.print("Selected: {s}  (project_id={d}, task_id={?d})", .{ c.label, c.project_id, c.task_id });
+        try color.off(out);
+        try out.writeByte('\n');
     } else {
-        try out.writeAll("No selection (cancelled or no terminal).\n");
+        try color.write(out, .dim, "No selection (cancelled or no terminal).\n");
     }
 }
 
@@ -960,7 +1049,7 @@ fn makeClient(arena: std.mem.Allocator, io: Io, env: *std.process.Environ.Map) !
 
     const token = env.get("TOGGL_API_TOKEN") orelse blk: {
         if (cfg.api_token.len > 0) break :blk cfg.api_token;
-        std.debug.print(
+        color.eprint(
             "No API token found. Run `toggl auth <token>` or set TOGGL_API_TOKEN.\n",
             .{},
         );
@@ -1012,7 +1101,7 @@ fn parseOpts(arena: std.mem.Allocator, args: []const [:0]const u8) !Opts {
 
 fn nextValue(args: []const [:0]const u8, i: *usize, name: []const u8) ![]const u8 {
     if (i.* + 1 >= args.len) {
-        std.debug.print("missing value for --{s}\n", .{name});
+        color.eprint("missing value for --{s}\n", .{name});
         return error.Usage;
     }
     i.* += 1;
@@ -1046,18 +1135,37 @@ fn lookupLabel(labels: []const cache.Entry, project_id: i64, task_id: ?i64) ?[]c
 }
 
 fn printEntry(io: Io, out: *Io.Writer, e: api.Client.TimeEntry, labels: []const cache.Entry, zone: localtz.Zone) !void {
-    const desc = e.description orelse "(no description)";
-    try out.print("  {s}\n", .{desc});
+    // Description is the headline (bold); a missing/empty one stands out in red.
+    try out.writeAll("  ");
+    const desc: ?[]const u8 = if (e.description) |d| (if (d.len > 0) d else null) else null;
+    if (desc) |d|
+        try color.write(out, .bold, d)
+    else
+        try missing(out, "NO DESCRIPTION PROVIDED");
+    try out.writeByte('\n');
 
     if (e.project_id) |pid| {
+        try color.write(out, .gray, "    project: ");
         if (lookupLabel(labels, pid, e.task_id)) |name| {
-            try out.print("    project: {s}\n", .{name});
+            try color.write(out, .cyan, name);
         } else {
             // Not in the cache yet (run `toggl sync`); fall back to ids.
-            try out.print("    project: #{d}", .{pid});
-            if (e.task_id) |tid| try out.print("   task: #{d}", .{tid});
-            try out.writeByte('\n');
+            try color.on(out, .cyan);
+            try out.print("#{d}", .{pid});
+            try color.off(out);
+            if (e.task_id) |tid| {
+                try color.write(out, .gray, "   task: ");
+                try color.on(out, .cyan);
+                try out.print("#{d}", .{tid});
+                try color.off(out);
+            }
         }
+        try out.writeByte('\n');
+    } else {
+        // No project at all — call it out in red.
+        try color.write(out, .gray, "    project: ");
+        try missing(out, "NO PROJECT PROVIDED");
+        try out.writeByte('\n');
     }
 
     const start_epoch: ?i64 = if (e.start) |s| timefmt.parseRfc3339(s) else null;
@@ -1066,11 +1174,14 @@ fn printEntry(io: Io, out: *Io.Writer, e: api.Client.TimeEntry, labels: []const 
         // Running: prefer computing elapsed from the parsed start (robust to
         // however Toggl encodes the negative duration), else fall back.
         const elapsed = if (start_epoch) |se| timefmt.nowUnix(io) - se else timefmt.nowUnix(io) + e.duration;
-        try out.writeAll("    elapsed: ");
+        try color.write(out, .gray, "    elapsed: ");
+        try color.on(out, .green);
         try printDuration(out, elapsed);
-        try out.writeAll(" (running)\n");
+        try out.writeAll(" (running)");
+        try color.off(out);
+        try out.writeByte('\n');
     } else {
-        try out.writeAll("    duration: ");
+        try color.write(out, .gray, "    duration: ");
         try printDuration(out, e.duration);
         try out.writeByte('\n');
     }
@@ -1080,10 +1191,10 @@ fn printEntry(io: Io, out: *Io.Writer, e: api.Client.TimeEntry, labels: []const 
 
     if (e.tags) |tags| {
         if (tags.len > 0) {
-            try out.writeAll("    tags: ");
+            try color.write(out, .gray, "    tags: ");
             for (tags, 0..) |tag, idx| {
                 if (idx != 0) try out.writeAll(", ");
-                try out.writeAll(tag);
+                try color.write(out, .yellow, tag);
             }
             try out.writeByte('\n');
         }
@@ -1094,7 +1205,46 @@ fn printEntry(io: Io, out: *Io.Writer, e: api.Client.TimeEntry, labels: []const 
 fn printLocal(out: *Io.Writer, zone: localtz.Zone, epoch: i64, label: []const u8) !void {
     var buf: [32]u8 = undefined;
     const rfc = try timefmt.epochToRfc3339(epoch + zone.offsetAt(epoch), &buf);
-    try out.print("    {s}: {s} {s} {s}\n", .{ label, rfc[0..10], rfc[11..16], zone.abbrevAt(epoch) });
+    try color.on(out, .gray);
+    try out.print("    {s}: ", .{label});
+    try color.off(out);
+    try out.print("{s} {s} {s}\n", .{ rfc[0..10], rfc[11..16], zone.abbrevAt(epoch) });
+}
+
+/// Print a bold, colored section header line (e.g. "Started:", "Running:").
+fn header(out: *Io.Writer, style: color.Style, text: []const u8) !void {
+    try color.on(out, .bold);
+    try color.on(out, style);
+    try out.writeAll(text);
+    try color.off(out);
+    try out.writeByte('\n');
+}
+
+/// Write a standout placeholder (bold red) for a missing field value.
+fn missing(out: *Io.Writer, text: []const u8) !void {
+    try color.on(out, .bold);
+    try color.on(out, .red);
+    try out.writeAll(text);
+    try color.off(out);
+}
+
+/// Build an editor-menu row whose value is a missing-field placeholder: gray
+/// label, bold-red value (e.g. "Project:      (none)").
+fn fieldRowMissing(arena: std.mem.Allocator, label: []const u8, value: []const u8) ![]const u8 {
+    var out: Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    try color.write(w, .gray, label);
+    try missing(w, value);
+    return out.written();
+}
+
+/// Print a dim horizontal rule `cols` columns wide — the `toggl list` separator.
+fn divider(out: *Io.Writer, cols: usize) !void {
+    try color.on(out, .dim);
+    var i: usize = 0;
+    while (i < cols) : (i += 1) try out.writeAll("\u{2500}"); // ─
+    try color.off(out);
+    try out.writeByte('\n');
 }
 
 fn printDuration(out: *Io.Writer, secs_in: i64) !void {
