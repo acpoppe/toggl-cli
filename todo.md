@@ -1,4 +1,2 @@
 - delete entries
 - add entries
-- start protection when already running
-- toggl resume

@@ -16,6 +16,7 @@ const usage =
     \\Usage:
     \\  toggl auth <api_token>             Save your API token + default workspace
     \\  toggl start <description> [opts]   Start a new running time entry
+    \\  toggl resume                       Resume the most recent entry (confirms first)
     \\  toggl stop                         Stop the currently running entry
     \\  toggl status                       Show the currently running entry
     \\  toggl update [opts]                Edit an entry (interactive, or running with flags)
@@ -74,6 +75,19 @@ const help_start =
     \\  toggl start "fixing the build"          # picker opens for the project
     \\  toggl start writing docs -p backend     # match project by name
     \\  toggl start review -p 12345 -t urgent   # explicit project id
+    \\
+;
+
+const help_resume =
+    \\toggl resume        (alias: continue)
+    \\
+    \\Resume your most recent time entry. It shows that entry and asks for
+    \\confirmation, then starts a new running entry copying its description,
+    \\project, task, and tags (with a fresh start time). Refuses if an entry is
+    \\already running — stop it first with `toggl stop`.
+    \\
+    \\Toggl has no dedicated resume endpoint; this mirrors the web app's
+    \\"Continue", which simply creates a new entry from the last one.
     \\
 ;
 
@@ -158,7 +172,7 @@ pub fn main(init: std.process.Init) !void {
         // Domain errors already printed a helpful message; anything else is
         // unexpected, so surface it.
         switch (err) {
-            error.ApiError, error.NoToken, error.Usage => {},
+            error.ApiError, error.NoToken, error.Usage, error.AlreadyRunning => {},
             else => color.eprint("error: {s}\n", .{@errorName(err)}),
         }
         out.flush() catch {};
@@ -217,6 +231,8 @@ fn run(
         try cmdAuth(arena, io, env, out, rest);
     } else if (eql(cmd, "start")) {
         try cmdStart(arena, io, env, out, rest);
+    } else if (eql(cmd, "resume") or eql(cmd, "continue")) {
+        try cmdResume(arena, io, env, out);
     } else if (eql(cmd, "stop")) {
         try cmdStop(arena, io, env, out);
     } else if (eql(cmd, "status") or eql(cmd, "current")) {
@@ -243,6 +259,7 @@ fn run(
 fn commandHelp(cmd: []const u8) ?[]const u8 {
     if (eql(cmd, "auth")) return help_auth;
     if (eql(cmd, "start")) return help_start;
+    if (eql(cmd, "resume") or eql(cmd, "continue")) return help_resume;
     if (eql(cmd, "stop")) return help_stop;
     if (eql(cmd, "status") or eql(cmd, "current")) return help_status;
     if (eql(cmd, "update")) return help_update;
@@ -296,6 +313,24 @@ fn cmdAuth(
     try color.off(out);
 }
 
+/// Refuse (red error + error.AlreadyRunning) if an entry is already running.
+/// Shared by `start` and `resume`, both of which create a new running entry.
+fn ensureNothingRunning(io: Io, client: *api.Client) !void {
+    const running = try client.current() orelse return;
+    const rdesc: []const u8 = if (running.description) |d|
+        (if (d.len > 0) d else "(no description)")
+    else
+        "(no description)";
+    const started: ?i64 = if (running.start) |s| timefmt.parseRfc3339(s) else null;
+    // u64 so `{d:0>2}` zero-pads without Zig emitting a `+` sign on signed ints.
+    const elapsed: u64 = @intCast(if (started) |se| @max(0, timefmt.nowUnix(io) - se) else 0);
+    color.eprint(
+        "An entry is already running: \"{s}\" ({d}h {d:0>2}m).\nStop it first with `toggl stop`.\n",
+        .{ rdesc, elapsed / 3600, (elapsed % 3600) / 60 },
+    );
+    return error.AlreadyRunning;
+}
+
 fn cmdStart(
     arena: std.mem.Allocator,
     io: Io,
@@ -316,6 +351,9 @@ fn cmdStart(
     var client = try makeClient(arena, io, env);
     defer client.deinit();
 
+    // Refuse to silently replace a running entry — Toggl would auto-stop it.
+    try ensureNothingRunning(io, &client);
+
     // start always tries to resolve a project: explicit id/name, else picker.
     const proj = try resolveProject(arena, io, env, &client, opts);
 
@@ -329,6 +367,56 @@ fn cmdStart(
     const labels = loadLabels(arena, io, env);
     const zone = localtz.load(arena, io);
     try header(out, .green, "Started:");
+    try printEntry(io, out, entry, labels, zone);
+}
+
+/// Resume the most recent entry: show it, confirm, then start a fresh running
+/// entry copying its description/project/task/tags. Toggl has no resume
+/// endpoint, so (like the web app's "Continue") this just creates a new entry.
+fn cmdResume(
+    arena: std.mem.Allocator,
+    io: Io,
+    env: *std.process.Environ.Map,
+    out: *Io.Writer,
+) !void {
+    var client = try makeClient(arena, io, env);
+    defer client.deinit();
+
+    try ensureNothingRunning(io, &client);
+
+    const recent = try client.list(null, null);
+    if (recent.len == 0) {
+        try color.write(out, .dim, "No recent entry to resume.\n");
+        return;
+    }
+    // Most recent by start time (none are running — that's guarded above).
+    var latest = recent[0];
+    for (recent[1..]) |e| {
+        const a = if (latest.start) |s| timefmt.parseRfc3339(s) orelse 0 else 0;
+        const b = if (e.start) |s| timefmt.parseRfc3339(s) orelse 0 else 0;
+        if (b > a) latest = e;
+    }
+
+    const labels = loadLabels(arena, io, env);
+    const zone = localtz.load(arena, io);
+
+    try header(out, .cyan, "Most recent entry:");
+    try printEntry(io, out, latest, labels, zone);
+    try out.flush();
+
+    const ok = try picker.confirm(io, "Resume this entry? [y/N] ");
+    if (!(ok orelse false)) {
+        try color.write(out, .dim, "Not resumed.\n");
+        return;
+    }
+
+    const entry = try client.start(.{
+        .description = latest.description orelse "",
+        .project_id = latest.project_id,
+        .task_id = latest.task_id,
+        .tags = latest.tags,
+    });
+    try header(out, .green, "Resumed:");
     try printEntry(io, out, entry, labels, zone);
 }
 

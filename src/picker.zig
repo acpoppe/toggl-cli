@@ -248,6 +248,34 @@ pub fn readLine(arena: std.mem.Allocator, io: Io, prompt: []const u8, initial: [
     }
 }
 
+/// Ask a yes/no question on the controlling terminal. Returns true only for
+/// y/Y, false for any other key, or null when there's no usable terminal (so
+/// the caller can choose the non-interactive default). Reads a single keypress
+/// (no Enter needed) and echoes it, since raw mode doesn't.
+pub fn confirm(io: Io, prompt: []const u8) !?bool {
+    const term = Term.open(io) orelse return null;
+    defer term.close();
+
+    var wbuf: [256]u8 = undefined;
+    var fw = term.tty.writer(io, &wbuf);
+    const w = &fw.interface;
+
+    try color.on(w, .bold);
+    try w.writeAll(prompt);
+    try color.off(w);
+    try w.flush();
+
+    var kbuf: [8]u8 = undefined;
+    const n = posix.read(term.fd, &kbuf) catch 0;
+    const yes = n > 0 and (kbuf[0] == 'y' or kbuf[0] == 'Y');
+
+    if (n > 0 and kbuf[0] >= 0x20 and kbuf[0] < 0x7f) w.writeByte(kbuf[0]) catch {};
+    w.writeAll("\r\n") catch {};
+    w.flush() catch {};
+
+    return yes;
+}
+
 fn moveUp(selected: *usize, offset: *usize) void {
     if (selected.* == 0) return;
     selected.* -= 1;
