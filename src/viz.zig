@@ -29,7 +29,75 @@ const Block = struct {
     dur_secs: i64,
     rgb: color.RGB,
     running: bool,
+    // Side-by-side layout for overlaps, filled by `layoutDays`: `lane` is this
+    // block's column within its overlap cluster, `lanes` the cluster's width.
+    lane: u8 = 0,
+    lanes: u8 = 1,
 };
+
+const max_lanes = 8;
+
+/// Assign overlap lanes per day (calendar-style): within each day, group
+/// transitively-overlapping blocks into a cluster, give each a lane (greedy
+/// first-fit), and record the cluster's lane count so the renderer can split
+/// the day's column. Mutates and sorts `blocks`.
+fn layoutDays(blocks: []Block) void {
+    std.mem.sort(Block, blocks, {}, struct {
+        fn lt(_: void, a: Block, b: Block) bool {
+            if (a.day != b.day) return a.day < b.day;
+            if (a.start_min != b.start_min) return a.start_min < b.start_min;
+            return a.end_min < b.end_min;
+        }
+    }.lt);
+
+    var i: usize = 0;
+    while (i < blocks.len) {
+        const d = blocks[i].day;
+        var dj = i;
+        while (dj < blocks.len and blocks[dj].day == d) dj += 1;
+
+        var c = i;
+        while (c < dj) {
+            // Extend the cluster while the next block starts before it ends.
+            var cluster_end: u16 = blocks[c].end_min;
+            var cj = c + 1;
+            while (cj < dj and blocks[cj].start_min < cluster_end) {
+                if (blocks[cj].end_min > cluster_end) cluster_end = blocks[cj].end_min;
+                cj += 1;
+            }
+            // First-fit lane assignment within [c, cj).
+            var lane_end = [_]u16{0} ** max_lanes;
+            var used: usize = 0;
+            var k = c;
+            while (k < cj) : (k += 1) {
+                var placed = false;
+                var l: usize = 0;
+                while (l < used) : (l += 1) {
+                    if (lane_end[l] <= blocks[k].start_min) {
+                        blocks[k].lane = @intCast(l);
+                        lane_end[l] = blocks[k].end_min;
+                        placed = true;
+                        break;
+                    }
+                }
+                if (!placed) {
+                    if (used < max_lanes) {
+                        blocks[k].lane = @intCast(used);
+                        lane_end[used] = blocks[k].end_min;
+                        used += 1;
+                    } else {
+                        blocks[k].lane = max_lanes - 1; // overflow: stack in last lane
+                    }
+                }
+            }
+            const L: u8 = @intCast(if (used == 0) 1 else used);
+            k = c;
+            while (k < cj) : (k += 1) blocks[k].lanes = L;
+            c = cj;
+        }
+        i = dj;
+    }
+}
 
 /// A controlling terminal in raw mode + alternate screen.
 const Term = struct {
@@ -184,6 +252,40 @@ fn eol(w: *Io.Writer) !void {
     try w.writeAll("\x1b[K\n"); // clear to end of line + newline
 }
 
+/// Render block `b`'s content for grid row `gr` into `width` columns: filled in
+/// the project color, with description / project / duration on successive rows
+/// (or just the duration when the block is one row tall).
+fn renderCell(w: *Io.Writer, b: Block, gr: usize, base: usize, rph: usize, width: usize) !void {
+    const bs: usize = b.start_min;
+    const be: usize = b.end_min;
+    const sr: usize = (bs - base) * rph / 60;
+    const er: usize = ((be - base) * rph + 59) / 60;
+    const height = if (er > sr) er - sr else 1;
+    const rel = gr - sr;
+    try color.bg(w, b.rgb);
+    try color.fg(w, color.textOn(b.rgb));
+    if (height == 1) {
+        var t: [32]u8 = undefined;
+        try padTrunc(w, fmtDur(&t, b.dur_secs), width);
+    } else if (rel == 0) {
+        try padTrunc(w, b.desc, width);
+    } else if (rel == 1 and height > 2) {
+        try padTrunc(w, b.project, width);
+    } else if (rel == height - 1) {
+        var t: [32]u8 = undefined;
+        const ds = fmtDur(&t, b.dur_secs);
+        if (b.running) {
+            var rb: [40]u8 = undefined;
+            try padTrunc(w, std.fmt.bufPrint(&rb, "{s} ▶", .{ds}) catch ds, width);
+        } else {
+            try padTrunc(w, ds, width);
+        }
+    } else {
+        try padTrunc(w, "", width);
+    }
+    try color.resetRaw(w);
+}
+
 fn render(w: *Io.Writer, io: Io, zone: localtz.Zone, week_mon: i64, blocks: []const Block, size: Size) !void {
     try w.writeAll("\x1b[H"); // cursor home
 
@@ -314,49 +416,39 @@ fn render(w: *Io.Writer, io: Io, zone: localtz.Zone, week_mon: i64, blocks: []co
         }
 
         for (0..7) |d| {
-            var found: ?Block = null;
+            // Collect the blocks active in this cell, keyed by lane. Any blocks
+            // active at the same instant overlap, so they share a lane count.
+            var lane_block = [_]?Block{null} ** max_lanes;
+            var lanes: usize = 1;
+            var any = false;
             for (blocks) |b| {
                 if (b.day != d) continue;
                 if (b.start_min < row_end and b.end_min > row_start) {
-                    found = b;
-                    break;
+                    any = true;
+                    lanes = b.lanes;
+                    lane_block[@as(usize, b.lane)] = b;
                 }
             }
-            if (found) |b| {
-                const bs: usize = b.start_min;
-                const be: usize = b.end_min;
-                const sr: usize = (bs - base) * rph / 60;
-                const er: usize = ((be - base) * rph + 59) / 60;
-                const height = if (er > sr) er - sr else 1;
-                const rel = gr - sr;
-                try color.bg(w, b.rgb);
-                try color.fg(w, color.textOn(b.rgb));
-                if (height == 1) {
-                    var t: [32]u8 = undefined;
-                    try padTrunc(w, fmtDur(&t, b.dur_secs), inner);
-                } else if (rel == 0) {
-                    try padTrunc(w, b.desc, inner);
-                } else if (rel == 1 and height > 2) {
-                    try padTrunc(w, b.project, inner);
-                } else if (rel == height - 1) {
-                    var t: [32]u8 = undefined;
-                    const ds = fmtDur(&t, b.dur_secs);
-                    if (b.running) {
-                        var rb: [40]u8 = undefined;
-                        try padTrunc(w, std.fmt.bufPrint(&rb, "{s} ▶", .{ds}) catch ds, inner);
-                    } else {
-                        try padTrunc(w, ds, inner);
-                    }
-                } else {
-                    try padTrunc(w, "", inner);
-                }
-                try color.resetRaw(w);
-            } else {
+            if (!any) {
                 try color.fg(w, tick);
                 try w.writeAll("┊");
                 try color.resetRaw(w);
                 var k: usize = 1;
                 while (k < inner) : (k += 1) try w.writeByte(' ');
+            } else {
+                if (lanes < 1) lanes = 1;
+                if (lanes > max_lanes) lanes = max_lanes;
+                const base_w = inner / lanes;
+                const extra = inner % lanes;
+                var lane: usize = 0;
+                while (lane < lanes) : (lane += 1) {
+                    const wl = base_w + (if (lane < extra) @as(usize, 1) else 0);
+                    if (lane_block[lane]) |b| {
+                        try renderCell(w, b, gr, base, rph, wl);
+                    } else {
+                        try padTrunc(w, "", wl); // empty lane within the cluster
+                    }
+                }
             }
             try w.writeByte(' ');
         }
@@ -399,7 +491,10 @@ fn loop(arena: std.mem.Allocator, io: Io, client: ?*api.Client, projects: []cons
             try w.writeAll("Loading…");
             try color.off(w);
             try w.flush();
-            blocks = fetchWeek(arena, io, client, projects, zone, week_mon, cur_mon) catch &.{};
+            const fetched = fetchWeek(arena, io, client, projects, zone, week_mon, cur_mon) catch &.{};
+            const laid = try arena.dupe(Block, fetched); // mutable copy to annotate
+            layoutDays(laid); // assign overlap lanes
+            blocks = laid;
             need_fetch = false;
             last = .{ .cols = 0, .rows = 0 }; // force a redraw
         }
@@ -466,13 +561,37 @@ const teal: color.RGB = .{ .r = 22, .g = 96, .b = 84 };
 const slate: color.RGB = .{ .r = 74, .g = 74, .b = 86 };
 const plum: color.RGB = .{ .r = 92, .g = 62, .b = 112 };
 
+test "layoutDays splits overlapping blocks into lanes per cluster" {
+    const mk = struct {
+        fn b(day: u8, s: u16, e: u16) Block {
+            return .{ .day = day, .start_min = s, .end_min = e, .desc = "", .project = "", .dur_secs = 0, .rgb = .{ .r = 0, .g = 0, .b = 0 }, .running = false };
+        }
+    }.b;
+    var blocks = [_]Block{
+        mk(1, 780, 1065), // A: overlaps B
+        mk(1, 780, 880), // B
+        mk(1, 1080, 1200), // C: separate cluster
+        mk(2, 600, 660), // D: adjacent to E (touch, no overlap)
+        mk(2, 660, 720), // E
+    };
+    layoutDays(&blocks);
+    // Sorted: day1 [B(780,880), A(780,1065), C], day2 [D, E].
+    try std.testing.expectEqual(@as(u8, 2), blocks[0].lanes); // B in 2-lane cluster
+    try std.testing.expectEqual(@as(u8, 0), blocks[0].lane);
+    try std.testing.expectEqual(@as(u8, 2), blocks[1].lanes); // A
+    try std.testing.expectEqual(@as(u8, 1), blocks[1].lane);
+    try std.testing.expectEqual(@as(u8, 1), blocks[2].lanes); // C alone
+    try std.testing.expectEqual(@as(u8, 1), blocks[3].lanes); // D (adjacent ≠ overlap)
+    try std.testing.expectEqual(@as(u8, 1), blocks[4].lanes); // E
+}
+
 fn demoBlocks() []const Block {
     const S = struct {
         const data = [_]Block{
             .{ .day = 0, .start_min = 780, .end_min = 1270, .desc = "crypto concept", .project = "OsteoCoach", .dur_secs = 29451, .rgb = gold, .running = false },
             .{ .day = 1, .start_min = 540, .end_min = 620, .desc = "mac runners be dead", .project = "devops", .dur_secs = 4801, .rgb = slate, .running = false },
-            .{ .day = 1, .start_min = 780, .end_min = 850, .desc = "sprint planning", .project = "OsteoCoach", .dur_secs = 4200, .rgb = gold, .running = false },
-            .{ .day = 1, .start_min = 850, .end_min = 1065, .desc = "crypto concept", .project = "OsteoCoach", .dur_secs = 12900, .rgb = gold, .running = false },
+            .{ .day = 1, .start_min = 780, .end_min = 1065, .desc = "crypto concept", .project = "OsteoCoach", .dur_secs = 17100, .rgb = gold, .running = false },
+            .{ .day = 1, .start_min = 780, .end_min = 880, .desc = "sprint planning", .project = "Internal", .dur_secs = 6000, .rgb = plum, .running = false },
             .{ .day = 1, .start_min = 1080, .end_min = 1238, .desc = "KLECOPY-564 Limesurvey", .project = "Klenico", .dur_secs = 9537, .rgb = teal, .running = false },
             .{ .day = 2, .start_min = 660, .end_min = 720, .desc = "Redesign + new team member", .project = "Internal", .dur_secs = 3600, .rgb = plum, .running = false },
             .{ .day = 2, .start_min = 780, .end_min = 1005, .desc = "KLECOPY-564 Limesurvey", .project = "Klenico: Neuentwicklung", .dur_secs = 13494, .rgb = teal, .running = false },
