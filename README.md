@@ -169,6 +169,7 @@ A full-screen week view — days as columns, hours as rows, each entry a filled 
 |---|---|
 | `←` / `→` or `p` / `n` | previous / next week |
 | `t` | jump to the current week |
+| `r` | refresh (re-fetch the current week; updates a running timer) |
 | `q` / `Esc` | quit |
 
 Needs a color terminal — truecolor is used when available, otherwise the nearest 256- or 16-color match.

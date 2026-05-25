@@ -173,6 +173,7 @@ const help_viz =
     \\Keys:
     \\  ← / →   or  p / n   previous / next week
     \\  t                   jump to the current week
+    \\  r                   refresh the current week (updates a running timer)
     \\  q / Esc             quit
     \\
     \\Project colors come from Toggl (run `toggl sync` to refresh them). Needs a

@@ -497,7 +497,7 @@ fn render(w: *Io.Writer, io: Io, zone: localtz.Zone, week_mon: i64, blocks: []co
         try color.off(w);
     }
     try color.on(w, .gray);
-    try w.writeAll("←/→ or p/n: change week   t: this week   q: quit");
+    try w.writeAll("←/→ or p/n: week   t: this week   r: refresh   q: quit");
     try color.off(w);
     try w.writeAll("\x1b[J"); // clear anything below
     try w.flush();
@@ -569,6 +569,7 @@ fn loop(arena: std.mem.Allocator, io: Io, client: ?*api.Client, projects: []cons
                 week_mon = cur_mon;
                 need_fetch = true;
             },
+            'r' => need_fetch = true, // re-fetch this week (also refreshes a running timer)
             27 => {
                 if (n == 1) return; // bare Esc
                 if (n >= 3 and kb[1] == '[') switch (kb[2]) {
