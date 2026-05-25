@@ -292,11 +292,11 @@ fn eol(w: *Io.Writer) !void {
 /// Render block `b`'s content for grid row `gr` into `width` columns: filled in
 /// the project color, with description / project / duration on successive rows
 /// (or just the duration when the block is one row tall).
-fn renderCell(w: *Io.Writer, b: Block, gr: usize, base: usize, rph: usize, width: usize) !void {
+fn renderCell(w: *Io.Writer, b: Block, gr: usize, base: usize, total_min: usize, grid_rows: usize, width: usize) !void {
     const bs: usize = b.start_min;
     const be: usize = b.end_min;
-    const sr: usize = (bs - base) * rph / 60;
-    const er: usize = ((be - base) * rph + 59) / 60;
+    const sr: usize = (bs - base) * grid_rows / total_min;
+    const er: usize = ((be - base) * grid_rows + total_min - 1) / total_min; // ceil
     const height = if (er > sr) er - sr else 1;
     const rel = gr - sr;
     try color.bg(w, b.rgb);
@@ -321,6 +321,24 @@ fn renderCell(w: *Io.Writer, b: Block, gr: usize, base: usize, rph: usize, width
         try padTrunc(w, "", width);
     }
     try color.resetRaw(w);
+}
+
+const Window = struct { vmin: usize, vmax: usize };
+
+/// Pick the visible hour window: at least 6 AM–10 PM, always covering the data,
+/// then widened toward 0–24h so that — mapped across `avail` rows — rows stay
+/// around two per hour instead of getting very tall. The result is always
+/// rendered across exactly `avail` rows, so the grid fills the screen height
+/// whatever the span (including a full 0–24h when an entry crosses midnight).
+fn chooseWindow(avail: usize, data_lo: usize, data_hi: usize) Window {
+    var vmin: usize = @min(data_lo, 6);
+    var vmax: usize = @max(data_hi, 22);
+    while ((vmax - vmin) * 2 < avail and (vmin > 0 or vmax < 24)) {
+        if (vmax < 24) vmax += 1;
+        if ((vmax - vmin) * 2 >= avail) break;
+        if (vmin > 0) vmin -= 1;
+    }
+    return .{ .vmin = vmin, .vmax = vmax };
 }
 
 fn render(w: *Io.Writer, io: Io, zone: localtz.Zone, week_mon: i64, blocks: []const Block, size: Size, load_failed: bool) !void {
@@ -394,7 +412,7 @@ fn render(w: *Io.Writer, io: Io, zone: localtz.Zone, week_mon: i64, blocks: []co
     }
     try eol(w);
 
-    // ---- choose visible hour window that fills the screen ----
+    // ---- visible hour window ----
     var min_min: u16 = 24 * 60;
     var max_min: u16 = 0;
     for (blocks) |b| {
@@ -404,43 +422,26 @@ fn render(w: *Io.Writer, io: Io, zone: localtz.Zone, week_mon: i64, blocks: []co
     const data_lo: usize = if (max_min == 0) 9 else min_min / 60;
     const data_hi: usize = if (max_min == 0) 17 else (max_min + 59) / 60;
 
-    var vmin: usize = @min(data_lo, 6);
-    var vmax: usize = @max(data_hi, 22);
-    const avail: usize = if (rows > 5) rows - 4 else (vmax - vmin);
-    var range: usize = vmax - vmin;
-    var rph: usize = avail / range;
-    if (rph < 1) rph = 1;
-    if (rph > 3) rph = 3;
-    while (range * rph < avail and (vmin > 0 or vmax < 24)) {
-        if (vmax < 24) {
-            vmax += 1;
-            range += 1;
-            if (range * rph >= avail) break;
-        }
-        if (vmin > 0) {
-            vmin -= 1;
-            range += 1;
-        }
-    }
-    if (range * rph > avail and range > 1) {
-        const show = @max(@as(usize, 1), avail / rph);
-        vmin = if (data_lo > 0) data_lo - 1 else 0;
-        if (vmin + show > 24) vmin = if (24 > show) 24 - show else 0;
-        vmax = @min(@as(usize, 24), vmin + show);
-        range = vmax - vmin;
-    }
-    const base: usize = vmin * 60;
-    const grid_rows: usize = range * rph;
+    const avail: usize = if (rows > 5) rows - 4 else 8;
+    const win = chooseWindow(avail, data_lo, data_hi);
+    const base: usize = win.vmin * 60;
+    const total_min: usize = (win.vmax - win.vmin) * 60;
+    // Map the window across exactly `avail` rows, so the grid always fills the
+    // screen height no matter how many hours it spans (incl. a full 0–24h when
+    // an entry crosses midnight).
+    const grid_rows: usize = avail;
 
     // ---- grid ----
+    var last_hr: usize = std.math.maxInt(usize);
     for (0..grid_rows) |gr| {
-        const row_start: usize = base + gr * 60 / rph;
-        const row_end: usize = base + (gr + 1) * 60 / rph;
+        const row_start: usize = base + gr * total_min / grid_rows;
+        const row_end: usize = base + (gr + 1) * total_min / grid_rows;
 
-        if (gr % rph == 0) {
-            const h24 = vmin + gr / rph;
-            const ampm = if (h24 < 12) "AM" else "PM";
-            var h12 = h24 % 12;
+        const hr = row_start / 60;
+        if (hr != last_hr) {
+            last_hr = hr;
+            const ampm = if (hr < 12) "AM" else "PM";
+            var h12 = hr % 12;
             if (h12 == 0) h12 = 12;
             var g: [8]u8 = undefined;
             const gs = std.fmt.bufPrint(&g, "{d:>2} {s} ", .{ h12, ampm }) catch "";
@@ -481,7 +482,7 @@ fn render(w: *Io.Writer, io: Io, zone: localtz.Zone, week_mon: i64, blocks: []co
                 while (lane < lanes) : (lane += 1) {
                     const wl = base_w + (if (lane < extra) @as(usize, 1) else 0);
                     if (lane_block[lane]) |b| {
-                        try renderCell(w, b, gr, base, rph, wl);
+                        try renderCell(w, b, gr, base, total_min, grid_rows, wl);
                     } else {
                         try padTrunc(w, "", wl); // empty lane within the cluster
                     }
@@ -655,6 +656,23 @@ test "appendBlocks splits an entry spanning midnight into per-day segments" {
     try std.testing.expectEqual(@as(u8, 1), list.items[1].day);
     try std.testing.expectEqual(@as(u16, 0), list.items[1].start_min); // 00:00
     try std.testing.expectEqual(@as(u16, 120), list.items[1].end_min); // 02:00
+}
+
+test "chooseWindow covers the data and fills the height" {
+    // Tall terminal, daytime data → widens toward a full day so rows ≈ 2/hour.
+    const a = chooseWindow(46, 8, 22);
+    try std.testing.expect(a.vmin <= 8 and a.vmax >= 22); // covers data
+    try std.testing.expect((a.vmax - a.vmin) * 2 >= 46); // wide enough to fill at ~2 rows/hr
+
+    // Midnight-spanning data (full 0–24h) → valid window, the regression case.
+    const b = chooseWindow(46, 0, 24);
+    try std.testing.expectEqual(@as(usize, 0), b.vmin);
+    try std.testing.expectEqual(@as(usize, 24), b.vmax);
+
+    // Short terminal → no over-expansion, still covers ≥ 6 AM–10 PM.
+    const c = chooseWindow(20, 8, 22);
+    try std.testing.expect(c.vmin <= 6 and c.vmax >= 22);
+    try std.testing.expect(c.vmax <= 24);
 }
 
 test "padTrunc keeps UTF-8 whole and pads to width" {
