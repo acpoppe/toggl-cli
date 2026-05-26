@@ -420,14 +420,18 @@ fn cmdStart(
     // start always tries to resolve a project: explicit id/name, else picker.
     const proj = try resolveProject(arena, io, env, &client, opts);
 
-    const entry = try client.start(.{
+    var labels = loadLabels(arena, io, env);
+
+    var args: api.Client.CreateArgs = .{
         .description = description,
+        .start = try timefmt.epochToRfc3339Alloc(arena, timefmt.nowUnix(io)),
+        .duration = -1, // negative duration == running entry
         .project_id = if (proj) |p| p.project_id else null,
         .task_id = if (proj) |p| p.task_id else null,
         .tags = opts.tagsSlice(),
-    });
-
-    const labels = loadLabels(arena, io, env);
+        .billable = if (proj) |p| (p.billable or lookupBillable(labels, p.project_id)) else false,
+    };
+    const entry = try createOrRefresh(arena, io, env, &client, &labels, &args);
     const zone = localtz.load(arena, io);
     try header(out, .green, "Started:");
     try printEntry(io, out, entry, labels, zone);
@@ -460,7 +464,7 @@ fn cmdResume(
         if (b > a) latest = e;
     }
 
-    const labels = loadLabels(arena, io, env);
+    var labels = loadLabels(arena, io, env);
     const zone = localtz.load(arena, io);
 
     try header(out, .cyan, "Most recent entry:");
@@ -473,12 +477,16 @@ fn cmdResume(
         return;
     }
 
-    const entry = try client.start(.{
+    var args: api.Client.CreateArgs = .{
         .description = latest.description orelse "",
+        .start = try timefmt.epochToRfc3339Alloc(arena, timefmt.nowUnix(io)),
+        .duration = -1,
         .project_id = latest.project_id,
         .task_id = latest.task_id,
         .tags = latest.tags,
-    });
+        .billable = lookupBillable(labels, latest.project_id),
+    };
+    const entry = try createOrRefresh(arena, io, env, &client, &labels, &args);
     try header(out, .green, "Resumed:");
     try printEntry(io, out, entry, labels, zone);
 }
@@ -580,7 +588,7 @@ fn interactiveUpdate(
     out: *Io.Writer,
 ) !void {
     const sel = try pickEntry(arena, io, env, client, out, "Pick an entry to edit — type to filter, ^J/^K or arrows move, Enter select, Esc cancel") orelse return;
-    try editEntry(arena, io, out, client, .edit, sel.entry, sel.projects, sel.zone);
+    try editEntry(arena, io, out, env, client, .edit, sel.entry, sel.projects, sel.zone);
 }
 
 /// A chosen entry plus the context needed to display/act on it.
@@ -684,7 +692,7 @@ fn cmdAdd(
         .start = try timefmt.epochToRfc3339Alloc(arena, timefmt.nowUnix(io)),
         .duration = -1, // running until a stop is added
     };
-    try editEntry(arena, io, out, &client, .add, template, projects, zone);
+    try editEntry(arena, io, out, env, &client, .add, template, projects, zone);
 }
 
 /// Whether the field-menu editor is editing an existing entry or creating a new
@@ -694,10 +702,12 @@ const EditMode = enum { edit, add };
 
 /// The field-menu editor for a single entry. `client` is optional: when null
 /// (demo mode) Save just prints the pending values instead of calling the API.
+/// `env` is only needed for the create-retry path; demo callers may pass null.
 fn editEntry(
     arena: std.mem.Allocator,
     io: Io,
     out: *Io.Writer,
+    env: ?*std.process.Environ.Map,
     client: ?*api.Client,
     mode: EditMode,
     entry: api.Client.TimeEntry,
@@ -839,16 +849,21 @@ fn editEntry(
                     };
 
                     if (client) |c| {
-                        const created = try c.create(.{
+                        var args: api.Client.CreateArgs = .{
                             .description = desc,
                             .start = try timefmt.epochToRfc3339Alloc(arena, se),
                             .duration = duration,
                             .project_id = project_id,
                             .task_id = task_id,
                             .tags = tags.items,
-                        });
+                            .billable = lookupBillable(projects, project_id),
+                        };
+                        var projects_mut: []const cache.Entry = projects;
+                        // env is non-null whenever client is non-null (only demo
+                        // callers pass null for both, and they don't take this branch).
+                        const created = try createOrRefresh(arena, io, env.?, c, &projects_mut, &args);
                         try header(out, .green, "Added:");
-                        try printEntry(io, out, created, projects, zone);
+                        try printEntry(io, out, created, projects_mut, zone);
                     } else {
                         try header(out, .cyan, "Would add (demo):");
                         try color.write(out, .gray, "  description: ");
@@ -1259,7 +1274,7 @@ fn cmdEditDemo(arena: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
         .duration = -1, // running
         .tags = &tags,
     };
-    try editEntry(arena, io, out, null, .edit, entry, &demo_projects, localtz.load(arena, io));
+    try editEntry(arena, io, out, null, null, .edit, entry, &demo_projects, localtz.load(arena, io));
 }
 
 /// Hidden command: run the new-entry editor (add mode) over sample data with no
@@ -1271,7 +1286,7 @@ fn cmdAddDemo(arena: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
         .start = try timefmt.epochToRfc3339Alloc(arena, timefmt.nowUnix(io)),
         .duration = -1,
     };
-    try editEntry(arena, io, out, null, .add, template, &demo_projects, localtz.load(arena, io));
+    try editEntry(arena, io, out, null, null, .add, template, &demo_projects, localtz.load(arena, io));
 }
 
 /// `toggl viz` — full-screen week calendar of your entries, colored by project.
@@ -1483,6 +1498,69 @@ fn lookupLabel(labels: []const cache.Entry, project_id: i64, task_id: ?i64) ?[]c
         if (l.project_id == project_id) return l.label;
     }
     return null;
+}
+
+/// Whether the project (if any) is billable, per the cached project list. Used
+/// to set the entry's `billable` flag on create so workspaces that require it
+/// don't reject the POST. False when project_id is null or unknown to the cache.
+fn lookupBillable(labels: []const cache.Entry, project_id: ?i64) bool {
+    const pid = project_id orelse return false;
+    for (labels) |l| {
+        if (l.project_id == pid) return l.billable;
+    }
+    return false;
+}
+
+/// Heuristic: does this failed POST look like the local cache disagreeing with
+/// the workspace (project archived, became billable, etc.)? Worth one refresh
+/// + retry. Other 400s (e.g. malformed input) are not.
+fn looksLikeStaleCache(status: u16, body: []const u8) bool {
+    if (status != 400 and status != 404) return false;
+    return containsIgnoreCase(body, "billable") or
+        containsIgnoreCase(body, "project") or
+        containsIgnoreCase(body, "workspace does not allow");
+}
+
+/// Force a cache rebuild from the API, persist it, and return the new entries.
+fn forceRefreshCache(
+    arena: std.mem.Allocator,
+    io: Io,
+    env: *std.process.Environ.Map,
+    client: *api.Client,
+) ![]cache.Entry {
+    const entries = try cache.build(arena, client);
+    try cache.save(arena, io, env, .{ .synced_at = timefmt.nowUnix(io), .entries = entries });
+    return entries;
+}
+
+/// `create`, with one cache-refresh retry if the failure looks like stale
+/// project data. Updates `*projects` to the refreshed list when a retry runs
+/// so the caller can print the resulting entry with current labels.
+fn createOrRefresh(
+    arena: std.mem.Allocator,
+    io: Io,
+    env: *std.process.Environ.Map,
+    c: *api.Client,
+    projects: *[]const cache.Entry,
+    args: *api.Client.CreateArgs,
+) !api.Client.TimeEntry {
+    if (c.create(args.*)) |entry| return entry else |err| switch (err) {
+        error.ApiError => {
+            if (!looksLikeStaleCache(c.last_error_status, c.last_error_body)) {
+                c.printLastError();
+                return err;
+            }
+            color.eprint("Project cache looks stale — refreshing and retrying...\n", .{});
+            const refreshed = try forceRefreshCache(arena, io, env, c);
+            projects.* = refreshed;
+            args.billable = lookupBillable(refreshed, args.project_id);
+            return c.create(args.*) catch |err2| {
+                c.printLastError();
+                return err2;
+            };
+        },
+        else => return err,
+    }
 }
 
 fn printEntry(io: Io, out: *Io.Writer, e: api.Client.TimeEntry, labels: []const cache.Entry, zone: localtz.Zone) !void {

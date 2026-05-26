@@ -22,6 +22,12 @@ pub const Client = struct {
     /// them). Set by `viz`, which owns the alt-screen and can't have stray
     /// stderr writes corrupting it.
     quiet: bool = false,
+    /// HTTP status from the most recent `create` that returned `ApiError`;
+    /// 0 when no error has been recorded. Lets callers retry on stale-cache
+    /// errors before surfacing them.
+    last_error_status: u16 = 0,
+    /// Server's response body matching `last_error_status`.
+    last_error_body: []const u8 = "",
 
     pub fn init(arena: std.mem.Allocator, io: Io, token: []const u8) !Client {
         // Toggl uses HTTP Basic auth with the API token as the username and the
@@ -104,14 +110,34 @@ pub const Client = struct {
     fn requestChecked(self: *Client, method: std.http.Method, url: []const u8, payload: ?[]const u8) ![]const u8 {
         const res = try self.request(method, url, payload);
         if (!res.ok()) {
-            if (!self.quiet) {
-                // Status line in red; leave the (possibly large) body uncolored.
-                color.eprint("Toggl API error: HTTP {d}\n", .{res.status});
-                std.debug.print("{s}\n", .{res.body});
-            }
+            self.last_error_status = res.status;
+            self.last_error_body = res.body;
+            if (!self.quiet) self.printLastError();
             return error.ApiError;
         }
         return res.body;
+    }
+
+    /// Like `requestChecked`, but never prints — caller is expected to inspect
+    /// `last_error_*` and either retry or call `printLastError` themselves.
+    fn requestSilent(self: *Client, method: std.http.Method, url: []const u8, payload: ?[]const u8) ![]const u8 {
+        const res = try self.request(method, url, payload);
+        if (!res.ok()) {
+            self.last_error_status = res.status;
+            self.last_error_body = res.body;
+            return error.ApiError;
+        }
+        return res.body;
+    }
+
+    /// Print the most recently captured API error to stderr, then clear it.
+    /// No-op when no error is pending.
+    pub fn printLastError(self: *Client) void {
+        if (self.last_error_status == 0) return;
+        color.eprint("Toggl API error: HTTP {d}\n", .{self.last_error_status});
+        std.debug.print("{s}\n", .{self.last_error_body});
+        self.last_error_status = 0;
+        self.last_error_body = "";
     }
 
     fn buildUrl(self: *Client, comptime fmt: []const u8, args: anytype) ![]const u8 {
@@ -167,6 +193,8 @@ pub const Client = struct {
         active: bool = true,
         /// Hex color (e.g. "#0b83d9"), as shown in the Toggl web UI.
         color: []const u8 = "",
+        /// Some workspaces require entries on billable projects to be billable.
+        billable: bool = false,
     };
 
     pub const Task = struct {
@@ -249,6 +277,7 @@ pub const Client = struct {
         project_id: ?i64 = null,
         task_id: ?i64 = null,
         tags: ?[]const []const u8 = null,
+        billable: bool = false,
     };
 
     /// Start a new running entry, beginning now.
@@ -261,6 +290,7 @@ pub const Client = struct {
             .project_id = args.project_id,
             .task_id = args.task_id,
             .tags = args.tags,
+            .billable = args.billable,
         });
     }
 
@@ -273,6 +303,7 @@ pub const Client = struct {
         project_id: ?i64 = null,
         task_id: ?i64 = null,
         tags: ?[]const []const u8 = null,
+        billable: bool = false,
     };
 
     /// Create a time entry with an explicit start + duration. A `duration` of
@@ -289,6 +320,7 @@ pub const Client = struct {
             project_id: ?i64 = null,
             task_id: ?i64 = null,
             tags: ?[]const []const u8 = null,
+            billable: bool = false,
         };
         const body = try self.toJson(Body{
             .description = args.description,
@@ -298,9 +330,12 @@ pub const Client = struct {
             .project_id = args.project_id,
             .task_id = args.task_id,
             .tags = args.tags,
+            .billable = args.billable,
         });
 
-        const resp = try self.requestChecked(
+        // Use the silent variant so callers (e.g. `toggl add`) can intercept
+        // failures and try a cache refresh + retry before surfacing the error.
+        const resp = try self.requestSilent(
             .POST,
             try self.buildUrl("/workspaces/{d}/time_entries", .{wid}),
             body,

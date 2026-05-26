@@ -5,6 +5,11 @@ const api = @import("api.zig");
 /// How long a cached project list is considered fresh.
 pub const ttl_seconds: i64 = 24 * 60 * 60;
 
+/// Bump whenever `Entry` gains fields that callers rely on. A cache written
+/// with an older version is treated as stale, so `ensureCache` silently
+/// rebuilds it on the next use — no user-visible migration step.
+pub const schema_version: u32 = 2;
+
 /// A single pickable choice: a project, or a project+task ("sub-project").
 /// `label` is the human-readable, fuzzy-matchable string, e.g.
 /// "Acme / Backend" or "Acme / Backend / Auth rework".
@@ -15,14 +20,21 @@ pub const Entry = struct {
     /// The project's Toggl hex color (e.g. "#0b83d9"); empty if unknown. Used by
     /// `toggl viz` to color blocks the same as the web UI.
     color: []const u8 = "",
+    /// Project's billable flag, mirrored so creates can satisfy workspaces
+    /// that require billable entries on billable projects.
+    billable: bool = false,
 };
 
 /// The on-disk cache document.
 pub const Cache = struct {
+    /// Schema version the file was written with. Defaults to 0 so caches
+    /// produced before this field existed are detected as outdated.
+    schema_version: u32 = 0,
     synced_at: i64 = 0,
     entries: []Entry = &.{},
 
     pub fn isFresh(self: Cache, now: i64) bool {
+        if (self.schema_version != schema_version) return false;
         return self.entries.len > 0 and (now - self.synced_at) < ttl_seconds;
     }
 };
@@ -53,8 +65,11 @@ pub fn save(arena: std.mem.Allocator, io: Io, environ_map: *std.process.Environ.
 
     try home.createDirPath(io, dir_rel);
 
+    var stamped = cache;
+    stamped.schema_version = schema_version;
+
     var out: Io.Writer.Allocating = .init(arena);
-    try std.json.Stringify.value(cache, .{ .whitespace = .indent_2 }, &out.writer);
+    try std.json.Stringify.value(stamped, .{ .whitespace = .indent_2 }, &out.writer);
 
     try home.writeFile(io, .{ .sub_path = file_rel, .data = out.written() });
 }
@@ -76,6 +91,7 @@ pub fn build(arena: std.mem.Allocator, client: *api.Client) ![]Entry {
             .project_id = p.id,
             .task_id = null,
             .color = p.color,
+            .billable = p.billable,
         });
     }
 
@@ -88,6 +104,7 @@ pub fn build(arena: std.mem.Allocator, client: *api.Client) ![]Entry {
             .project_id = t.project_id,
             .task_id = t.id,
             .color = p.color, // tasks inherit their project's color
+            .billable = p.billable, // tasks inherit billability from project
         });
     }
 
