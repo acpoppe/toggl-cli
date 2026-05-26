@@ -952,18 +952,20 @@ fn editTime(arena: std.mem.Allocator, io: Io, out: *Io.Writer, zone: localtz.Zon
     // so "+1h" still works when there's no current value).
     const anchor: ?i64 = current orelse base;
 
-    const example: []const u8 = if (anchor) |c| ex: {
-        var buf: [32]u8 = undefined;
-        const rfc = try timefmt.epochToRfc3339(c + zone.offsetAt(c), &buf);
-        const part = try arena.dupe(u8, rfc[0..16]); // "YYYY-MM-DDTHH:MM"
-        part[10] = ' ';
-        break :ex part;
-    } else "2026-05-24 14:30";
+    // Derive both a clock-only and a full date+time example from the same
+    // anchor (or now, as a fallback) so they stay consistent — and so the
+    // clock-only one demonstrates that the date is optional.
+    const example_epoch = anchor orelse timefmt.nowUnix(io);
+    var buf: [32]u8 = undefined;
+    const rfc = try timefmt.epochToRfc3339(example_epoch + zone.offsetAt(example_epoch), &buf);
+    const full_example = try arena.dupe(u8, rfc[0..16]); // "YYYY-MM-DDTHH:MM"
+    full_example[10] = ' ';
+    const clock_example = full_example[11..16];
 
     const prompt = try std.fmt.allocPrint(
         arena,
-        "New {s} (-15m, +1h30m, or {s}): ",
-        .{ which, example },
+        "New {s} (-15m, +1h30m, {s}, or {s}): ",
+        .{ which, clock_example, full_example },
     );
     const line = (try picker.readLine(arena, io, prompt, "")) orelse return null;
     const s = std.mem.trim(u8, line, " \t");
@@ -1037,21 +1039,28 @@ fn parseOffsetSeconds(s: []const u8) ?i64 {
 }
 
 /// Parse an absolute *local* time and return the UTC epoch. Accepts
-/// "YYYY-MM-DD HH:MM[:SS]" or "HH:MM" (today, local). The entered wall time is
+/// "YYYY-MM-DD HH:MM[:SS]" or "HH:MM" (today, local), with the hour optionally
+/// a single digit (e.g. "9:25" or "2026-05-24 9:25"). The entered wall time is
 /// converted to UTC using the zone's offset at that instant.
 fn parseAbsoluteLocal(io: Io, zone: localtz.Zone, s: []const u8) ?i64 {
     const wall: i64 = blk: {
-        // Full date-time.
-        if (s.len >= 16 and s[4] == '-' and s[7] == '-') {
+        // Full date-time. Minimum length is "YYYY-MM-DD H:MM" = 15.
+        if (s.len >= 15 and s[4] == '-' and s[7] == '-' and (s[10] == ' ' or s[10] == 'T')) {
             const y = pInt(s[0..4]) orelse return null;
             const mo = pInt(s[5..7]) orelse return null;
             const d = pInt(s[8..10]) orelse return null;
-            const h = pInt(s[11..13]) orelse return null;
-            const mi = pInt(s[14..16]) orelse return null;
-            const se: i64 = if (s.len >= 19 and s[16] == ':') (pInt(s[17..19]) orelse 0) else 0;
+            // Hour may be 1 or 2 digits, so locate the colon rather than hard-
+            // coding indices.
+            const tp = s[11..];
+            const colon = std.mem.indexOfScalar(u8, tp, ':') orelse return null;
+            const h = pInt(tp[0..colon]) orelse return null;
+            if (tp.len < colon + 3) return null;
+            const mi = pInt(tp[colon + 1 .. colon + 3]) orelse return null;
+            const rest = tp[colon + 3 ..];
+            const se: i64 = if (rest.len >= 3 and rest[0] == ':') (pInt(rest[1..3]) orelse 0) else 0;
             break :blk timefmt.civilToEpoch(y, mo, d, h, mi, se);
         }
-        // Clock time today (local).
+        // Clock time today (local). Hour may be 1 or 2 digits.
         if (std.mem.indexOfScalar(u8, s, ':')) |c| {
             const h = pInt(s[0..c]) orelse return null;
             const mi = pInt(s[c + 1 ..]) orelse return null;
